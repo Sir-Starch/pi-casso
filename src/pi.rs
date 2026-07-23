@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
+#[cfg(not(target_env = "msvc"))]
 use rug::{Integer, ops::Pow};
 
 use crate::digits::{DigitSource, convert_ascii_digits};
@@ -407,6 +408,7 @@ fn generate_into_cache_fast(cache: &PiCache, digits: u64, stop: Arc<AtomicBool>)
     Ok(prefix.len().saturating_sub(start) as u64)
 }
 
+#[cfg(not(target_env = "msvc"))]
 pub fn chudnovsky_pi_digits(digits: usize) -> Result<Vec<u8>> {
     if digits == 0 {
         return Ok(Vec::new());
@@ -440,6 +442,14 @@ pub fn chudnovsky_pi_digits(digits: usize) -> Result<Vec<u8>> {
         .collect()
 }
 
+#[cfg(target_env = "msvc")]
+pub fn chudnovsky_pi_digits(_digits: usize) -> Result<Vec<u8>> {
+    bail!(
+        "Fast built-in CPU generation (Chudnovsky) is not supported on Windows MSVC. Please use the y-cruncher backend or the unbounded (spigot) mode."
+    );
+}
+
+#[cfg(not(target_env = "msvc"))]
 fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
     if b - a == 1 {
         if a == 0 {
@@ -497,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_env = "msvc"))]
     fn chudnovsky_generates_pi_prefix() {
         let digits = chudnovsky_pi_digits(32).unwrap();
         assert_eq!(
