@@ -1,0 +1,38 @@
+[package]
+name = "pi-casso"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Search pi digits for visual echoes of ASCII art."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/Sir-Starch/pi-casso"
+homepage = "https://github.com/Sir-Starch/pi-casso"
+keywords = ["pi", "ascii-art", "search", "tui"]
+categories = ["command-line-utilities", "mathematics"]
+exclude = ["pi-digits.txt", "*.export.json"]
+
+[dependencies]
+anyhow = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+ctrlc = "3.4"
+directories = "5.0"
+num-bigint = "0.4"
+num-traits = "0.2"
+pollster = "0.4"
+ratatui = "0.29"
+rayon = "1.10"
+rug = "1.30"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+wgpu = "25.0"
+
+[dev-dependencies]
+tempfile = "3.13"

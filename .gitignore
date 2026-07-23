@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+
+# Pi digit data (too large for git)
+pi-digits.txt
+*.digits
+
+# Export/session files
+*.export.json
+pi-casso-*-export.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Profiling / benchmarking artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
