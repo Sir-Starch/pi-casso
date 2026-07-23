@@ -560,9 +560,16 @@ fn row_to_event(
     })
 }
 
-pub fn db_path() -> Result<PathBuf> {
+pub fn app_data_dir() -> Result<PathBuf> {
+    if let Ok(env_dir) = std::env::var("PI_CASSO_DATA_DIR") {
+        return Ok(PathBuf::from(env_dir));
+    }
     let base = BaseDirs::new().ok_or_else(|| anyhow!("could not determine data directory"))?;
-    Ok(base.data_dir().join("pi-casso").join("pi-casso.db"))
+    Ok(base.data_dir().join("pi-casso"))
+}
+
+pub fn db_path() -> Result<PathBuf> {
+    Ok(app_data_dir()?.join("pi-casso.db"))
 }
 
 fn bool_to_i64(value: bool) -> i64 {

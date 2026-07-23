@@ -9,9 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use directories::BaseDirs;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
+#[cfg(not(target_env = "msvc"))]
 use rug::{Integer, ops::Pow};
 
 use crate::digits::{DigitSource, convert_ascii_digits};
@@ -19,8 +19,11 @@ use crate::digits::{DigitSource, convert_ascii_digits};
 pub const DEFAULT_GENERATE_CHUNK: usize = 10_000;
 pub const ON_DEMAND_CACHE_LEAD: u64 = 10_000;
 
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_DIGITS_PER_TERM: f64 = 14.181_647_462_725_477;
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_C3_OVER_24: u64 = 10_939_058_860_032_000;
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_PARALLEL_THRESHOLD: u64 = 32;
 static PI_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -408,6 +411,7 @@ fn generate_into_cache_fast(cache: &PiCache, digits: u64, stop: Arc<AtomicBool>)
     Ok(prefix.len().saturating_sub(start) as u64)
 }
 
+#[cfg(not(target_env = "msvc"))]
 pub fn chudnovsky_pi_digits(digits: usize) -> Result<Vec<u8>> {
     if digits == 0 {
         return Ok(Vec::new());
@@ -441,6 +445,14 @@ pub fn chudnovsky_pi_digits(digits: usize) -> Result<Vec<u8>> {
         .collect()
 }
 
+#[cfg(target_env = "msvc")]
+pub fn chudnovsky_pi_digits(_digits: usize) -> Result<Vec<u8>> {
+    bail!(
+        "Fast built-in CPU generation (Chudnovsky) is not supported on Windows MSVC. Please use the y-cruncher backend or the unbounded (spigot) mode."
+    );
+}
+
+#[cfg(not(target_env = "msvc"))]
 fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
     if b - a == 1 {
         if a == 0 {
@@ -477,8 +489,7 @@ fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
 }
 
 pub fn cache_path() -> Result<PathBuf> {
-    let base = BaseDirs::new().ok_or_else(|| anyhow!("could not determine data directory"))?;
-    Ok(base.data_dir().join("pi-casso").join("pi-cache.txt"))
+    Ok(crate::storage::app_data_dir()?.join("pi-cache.txt"))
 }
 
 #[cfg(test)]
@@ -499,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_env = "msvc"))]
     fn chudnovsky_generates_pi_prefix() {
         let digits = chudnovsky_pi_digits(32).unwrap();
         assert_eq!(
