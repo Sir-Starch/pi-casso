@@ -52,7 +52,7 @@ fn test_invalid_digit_file() {
     let data_dir = dir.path().join("data");
 
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args([
             "start",
             "--template",
@@ -79,7 +79,7 @@ fn test_finite_search_and_json_export() {
 
     // 1. Start search
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args([
             "start",
             "--template",
@@ -98,7 +98,7 @@ fn test_finite_search_and_json_export() {
 
     // 2. Status
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args(["status", "test-search"])
         .assert()
         .success()
@@ -106,7 +106,7 @@ fn test_finite_search_and_json_export() {
 
     // 3. JSON Export
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args(["export", "test-search", "--format", "json"])
         .assert()
         .success()
@@ -121,7 +121,7 @@ fn test_resume_search() {
     let data_dir = dir.path().join("data");
 
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args([
             "start",
             "--template",
@@ -140,7 +140,7 @@ fn test_resume_search() {
         .success();
 
     pi_casso_cmd()
-        .env("XDG_DATA_HOME", data_dir.to_str().unwrap())
+        .env("PI_CASSO_DATA_DIR", data_dir.to_str().unwrap())
         .args(["resume", "test-resume", "--no-tui", "--max-offset", "10"])
         .assert()
         .success()

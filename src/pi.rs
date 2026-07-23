@@ -9,7 +9,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use directories::BaseDirs;
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use rug::{Integer, ops::Pow};
@@ -477,8 +476,7 @@ fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
 }
 
 pub fn cache_path() -> Result<PathBuf> {
-    let base = BaseDirs::new().ok_or_else(|| anyhow!("could not determine data directory"))?;
-    Ok(base.data_dir().join("pi-casso").join("pi-cache.txt"))
+    Ok(crate::storage::app_data_dir()?.join("pi-cache.txt"))
 }
 
 #[cfg(test)]
