@@ -19,8 +19,11 @@ use crate::digits::{DigitSource, convert_ascii_digits};
 pub const DEFAULT_GENERATE_CHUNK: usize = 10_000;
 pub const ON_DEMAND_CACHE_LEAD: u64 = 10_000;
 
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_DIGITS_PER_TERM: f64 = 14.181_647_462_725_477;
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_C3_OVER_24: u64 = 10_939_058_860_032_000;
+#[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_PARALLEL_THRESHOLD: u64 = 32;
 static PI_GENERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
