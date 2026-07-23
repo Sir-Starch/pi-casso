@@ -7,6 +7,7 @@
 A fast, resumable Rust CLI and TUI that scans real digits of π for patterns resembling ASCII art.
 
 [![Status: gloriously useless](https://img.shields.io/badge/status-gloriously%20useless-ff69b4)](#why)
+[![CI](https://github.com/Sir-Starch/pi-casso/actions/workflows/ci.yml/badge.svg)](https://github.com/Sir-Starch/pi-casso/actions/workflows/ci.yml)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024-000000?logo=rust)](https://www.rust-lang.org/)
 [![Terminal UI](https://img.shields.io/badge/interface-TUI-4EAA25?logo=gnometerminal&logoColor=white)](#terminal-ui)
 [![GPU acceleration](https://img.shields.io/badge/GPU-optional-7B68EE)](#performance-and-gpu)
@@ -89,16 +90,19 @@ It is the project’s only reliable source of long-term engagement.
 
 ### Build
 
-From the repository root:
-
+From the repository
 ```sh
 cargo build --release
+./target/release/pi-casso
 ```
 
-The binary is written to:
+Alternatively, install it locally:
 
-```text
-target/release/pi-casso
+```sh
+git clone https://github.com/Sir-Starch/pi-casso.git
+cd pi-casso
+cargo install --path .
+pi-casso
 ```
 
 ### Launch the TUI
@@ -148,8 +152,22 @@ every target placement. A candidate scores well when one repeated digit covers
 the target shape without leaking too much into its local background:
 
 ```text
-score = 0.85 × coverage + 0.15 × (1 − leakage)
+coverage_density = coverage²
+contrast = max(0, (coverage − leakage) / max(1 − leakage, ε))
+cleanliness = 1 − leakage
+
+score =
+    0.70 × coverage_density
+  + 0.20 × contrast
+  + 0.10 × cleanliness
 ```
+
+- **coverage** measures how completely the target shape is covered by one repeated digit.
+- **leakage** measures how much that digit spills into the background.
+- **contrast** rewards a noticeable difference between the shape and its background.
+- **squared coverage (density)** penalizes incomplete shapes more heavily.
+
+*(Special case: if `coverage == 1.0` and `leakage == 0.0`, the score is exactly `1.0`.)*
 
 The target and digit canvas have separate dimensions. The default endless
 search places a `12x12` target inside a `24x24` canvas:
@@ -190,7 +208,8 @@ pi-casso start \
 
 Use `--invert` to compare against the inverted bitmap as well.
 
-## Pi sources
+<details>
+<summary><h2>Pi sources</h2></summary>
 
 ### Generated cache
 
@@ -261,6 +280,8 @@ pi-casso pi import ./pi-with-prefix.txt --allow-decimal-prefix
 When a finite `start` command has no `--pi-file`, `pi-casso` uses a tiny embedded
 sample and prints a warning. It is intended for smoke tests and previews, not
 for finding enlightenment in the first few digits.
+
+</details>
 
 ## Templates and custom art
 
@@ -363,7 +384,8 @@ pi-casso start \
   --max-offset 10000000
 ```
 
-## Performance and GPU
+<details>
+<summary><h2>Performance and GPU</h2></summary>
 
 The default `balanced` profile controls worker count, chunk size, throttling,
 checkpoint cadence, memory budget, and TUI refresh rate without changing search
@@ -456,6 +478,8 @@ workers, CPU target, GPU device or fallback state, chunk size, queue depth,
 estimated memory, thermal mode, cache gap, and throughput. Apparently even
 pointlessness needs observability.
 
+</details>
+
 ## Plain output example
 
 ```text
@@ -472,7 +496,8 @@ finished: limit reached (offset=1000000, scanned=1000000, best=91.80%)
 progress saved. Resume will continue from the current offset.
 ```
 
-## Storage and architecture
+<details>
+<summary><h2>Storage and architecture</h2></summary>
 
 Digit input is abstracted behind `DigitSource`. File, demo, cache, and generated
 sources can share the same search pipeline.
@@ -502,6 +527,8 @@ best-match updates + checkpoints
     ↓
 TUI / plain output / JSON export
 ```
+
+</details>
 
 ## Project status
 

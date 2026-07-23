@@ -67,6 +67,7 @@ const PERFORMANCE_PROFILES: [PerformanceProfile; 4] = [
     PerformanceProfile::Performance,
     PerformanceProfile::Max,
 ];
+const DEFAULT_PROFILE_IDX: usize = 1;
 
 const SIZE_MODES: [(&str, usize, usize); 4] = [
     ("8x8", 8, 8),
@@ -197,7 +198,7 @@ impl Default for NewSearchForm {
             width: "12".to_string(),
             height: "12".to_string(),
             threshold: "5".to_string(),
-            profile_idx: 2,
+            profile_idx: DEFAULT_PROFILE_IDX,
             workers: String::new(),
             limit: String::new(),
             allow_decimal_prefix: false,
@@ -2457,4 +2458,23 @@ fn sanitize_filename(value: &str) -> String {
         })
         .collect();
     sanitized.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_tui_profile_is_balanced() {
+        assert_eq!(
+            PERFORMANCE_PROFILES[DEFAULT_PROFILE_IDX],
+            PerformanceProfile::Balanced
+        );
+
+        let form = NewSearchForm::default();
+        assert_eq!(
+            PERFORMANCE_PROFILES[form.profile_idx],
+            PerformanceProfile::Balanced
+        );
+    }
 }
