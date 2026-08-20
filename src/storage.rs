@@ -144,6 +144,8 @@ impl Storage {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
+        configure_connection(&conn)
+            .with_context(|| format!("failed to configure database {}", path.display()))?;
         let storage = Self { conn };
         storage
             .migrate()
@@ -560,6 +562,22 @@ fn row_to_event(
     })
 }
 
+/// The TUI runs a search worker on its own connection while the main thread keeps
+/// reading run lists, so the database is genuinely used concurrently. WAL lets a
+/// reader and a writer coexist, and the busy timeout absorbs the remaining
+/// writer-vs-writer overlap instead of failing with `database is locked`.
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA foreign_keys = ON;
+        "#,
+    )?;
+    Ok(())
+}
+
 pub fn app_data_dir() -> Result<PathBuf> {
     if let Ok(env_dir) = std::env::var("PI_CASSO_DATA_DIR") {
         return Ok(PathBuf::from(env_dir));
@@ -634,5 +652,56 @@ mod tests {
         let loaded = storage.resolve_run("test").unwrap();
         assert_eq!(loaded.current_offset, 9);
         assert_eq!(loaded.scanned_windows, 5);
+    }
+
+    #[test]
+    fn wal_mode_is_enabled() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open_path(dir.path().join("state.db")).unwrap();
+        let mode: String = storage
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn a_writer_and_a_reader_can_share_the_database() {
+        // The TUI does exactly this: the search worker checkpoints on one
+        // connection while the UI thread lists runs on another. Without WAL and
+        // a busy timeout this fails with "database is locked".
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let mut writer = Storage::open_path(&db).unwrap();
+        let reader = Storage::open_path(&db).unwrap();
+
+        let target = Bitmap::new(2, 2, vec![1, 0, 0, 1]).unwrap();
+        let mut run = writer
+            .create_run(NewRun {
+                name: "shared".to_string(),
+                source: DigitSourceSpec::demo(),
+                template_name: None,
+                art_hash: target.sha256(),
+                width: 2,
+                height: 2,
+                canvas_width: 2,
+                canvas_height: 2,
+                match_mode: MatchMode::Threshold,
+                threshold: 5,
+                invert_enabled: false,
+                start_offset: Some(0),
+                target_bitmap: target,
+                generated_digit_count: 0,
+                params_json: "{}".to_string(),
+            })
+            .unwrap();
+
+        for offset in 1..=25u64 {
+            run.current_offset = offset;
+            writer.update_run(&mut run).unwrap();
+            let runs = reader.list_runs().expect("reader must not be locked out");
+            assert_eq!(runs.len(), 1);
+        }
+        assert_eq!(reader.resolve_run("shared").unwrap().current_offset, 25);
     }
 }

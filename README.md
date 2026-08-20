@@ -29,15 +29,42 @@ A fast, resumable Rust CLI and TUI that scans real digits of π for patterns res
 ## Terminal UI
 
 <p align="center">
-  <img src="docs/assets/pi-casso-tui.png"
-       alt="pi-casso terminal interface showing an active search"
+  <img src="docs/assets/tui-hunt.png"
+       alt="The HUNT tab during a live search: throughput, best score, pi cache growth, the target mask, and the raw pi digits of the best match"
        width="960">
+  <br>
+  <em>HUNT, mid-search — the emerged digit highlighted where it lands on the target</em>
 </p>
 
-The interactive interface includes a home screen, search wizard, saved-run
-browser, template previews, digit import, live metrics, pause, checkpoints,
-export, and safe quit controls. Humanity demanded dashboards even for searching
-π for a tiny Arch logo, so here we are.
+<p align="center">
+  <img src="docs/assets/tui-wizard.png"
+       alt="The new-search wizard: essential fields, a green START SEARCH button, and advanced options below a separator"
+       width="960">
+  <br>
+  <em>The wizard — essentials, then START SEARCH, then everything with a default</em>
+</p>
+
+Five tabs, a command palette, and a search that keeps running underneath all of
+them. Humanity demanded dashboards even for searching π for a tiny Arch logo, so
+here we are.
+
+| Tab | What lives there |
+| --- | --- |
+| **HUNT** | The new-search wizard, or the live dashboard once a hunt is running |
+| **RUNS** | Every saved run, with its target, best match and history alongside |
+| **GALLERY** | Built-in templates and their previews |
+| **DATA** | π cache status and digit-file import |
+| **SETTINGS** | Theme, glyphs and search defaults, written to `config.toml` |
+
+`1`–`5` or `Tab` switch tabs, `ctrl+p` opens a fuzzy command palette listing
+every action available right where you are, and `?` (or `F1`) shows the keys for
+the current view. Both are generated from the same registry the keys resolve
+against, so they cannot describe a binding that no longer exists.
+
+Bitmaps switch to half-block rendering when a panel is too short for one row per
+pixel, which is how a 24×24 emergence canvas fits next to its target instead of
+scrolling. Three themes ship — `dark`, `light` and `mono` — and Unicode glyphs
+can be turned off independently of colour.
 
 ## Why
 
@@ -71,7 +98,7 @@ It is the project’s only reliable source of long-term engagement.
 
 ## Features
 
-- Interactive terminal UI with live search metrics
+- Tabbed terminal UI with a command palette, live metrics and three themes
 - Built-in `arch` and `pi` ASCII-art templates
 - Custom `.txt` artwork
 - `8x8`, `12x12`, `16x16`, and custom target sizes
@@ -79,7 +106,9 @@ It is the project’s only reliable source of long-term engagement.
 - Finite searches over local digit files
 - Resumable runs and periodic checkpoints
 - Best-match improvement history
-- SQLite state under `$XDG_DATA_HOME/pi-casso/pi-casso.db`
+- SQLite state under `$XDG_DATA_HOME/pi-casso/pi-casso.db`, in WAL mode so a
+  running hunt and a `pi-casso list` never lock each other out
+- Persistent preferences in `$XDG_CONFIG_HOME/pi-casso/config.toml`
 - CPU resource and thermal controls
 - Optional GPU emergence scoring through `wgpu`
 - Plain output for scripts and servers
@@ -463,22 +492,126 @@ pi-casso benchmark --template arch --seconds 10 --profile performance --backend 
 
 ### TUI controls
 
+Global, everywhere:
+
 | Key | Action |
 | --- | --- |
-| `1` / `2` / `3` / `4` | Select `eco`, `balanced`, `performance`, or `max` |
-| `p` or `Space` | Pause or resume |
-| `g` | Cycle GPU mode |
+| `1`–`5`, `Tab` / `Shift+Tab` | Switch tabs |
+| `ctrl+p` | Command palette |
+| `?` or `F1` | Help for the current view |
+| `ctrl+q` / `ctrl+c` | Quit, checkpointing any live search first |
+
+In the wizard:
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move between fields |
+| `←` / `→` / `Space` | Adjust the focused choice, number or toggle |
+| `Enter` | Next field, or start when the Start row has focus |
+| `F9` | Start immediately, from any field |
+
+**START SEARCH** sits directly after the essentials, with everything that has a
+sensible default below it under an `advanced` heading — five presses of `Enter`
+from a cold start, or one click, or `F9` from wherever you happen to be.
+
+While a hunt is running:
+
+| Key | Action |
+| --- | --- |
+| `Space` | Pause or resume |
+| `p` | Next performance profile |
+| `F2` / `F3` / `F4` / `F5` | Select `eco`, `balanced`, `performance`, or `max` directly |
 | `+` / `-` | Adjust workers |
 | `]` / `[` | Adjust chunk size |
+| `g` | Cycle GPU mode |
 | `t` | Cycle thermal mode |
 | `m` | Toggle metrics |
+| `s` | Save a checkpoint now |
+| `e` | Export the run to JSON |
+| `Esc` | Stop, saving a checkpoint |
 
-The dashboard displays the active profile and backend, generator backend,
-workers, CPU target, GPU device or fallback state, chunk size, queue depth,
-estimated memory, thermal mode, cache gap, and throughput. Apparently even
-pointlessness needs observability.
+Anything with a key also appears in the command palette, along with the actions
+that have none. A focused text field takes printable keys before any shortcut
+does, so a path containing an `h` is typeable — which it previously was not.
+
+### Mouse
+
+Everything that looks clickable is clickable:
+
+| Target | Click does |
+| --- | --- |
+| A tab | Switches to it |
+| A list row | Selects it |
+| A form field | Focuses it — and on a choice or toggle, advances it |
+| **START SEARCH** | Starts the hunt |
+| A key cap in the bottom bar | Runs that action |
+| A command in the palette | Runs it; clicking outside dismisses it |
+| **Delete** / **Cancel** in a confirmation | Answers it |
+
+Clicking a value changes the value, because that is what a value that looks like
+a button should do. The wheel scrolls lists and moves focus through forms.
+
+Filled key caps in the bottom bar are buttons; dim ones are descriptions of how
+the keyboard behaves there and do nothing on a click. Nothing in the interface
+is keyboard-only.
+
+### What the dashboard tells you
+
+Throughput is reported **over the last few seconds**, with the session average as
+small print beneath it. A cumulative average barely moves when a search slows
+down and never visibly recovers, which makes it useless for the question people
+actually ask — so switching profile with `p` shows up in the headline number and
+the sparkline right away.
+
+The π cache metric distinguishes the two reasons a search might pause. When the
+search outruns the generator it reads `+69.0K/s, 4.3M to go` — digits are being
+computed and here is how fast. Only a genuinely stopped producer reads as
+`waiting for digits`. The old interface called both of them "waiting for more
+pi", which made productive work look like a hang.
+
+The best match is shown as the raw π digits of the winning window, with the
+emerged digit highlighted where it lands on the target, above a line giving that
+digit, its position, coverage and leakage. Apparently even pointlessness needs
+observability.
 
 </details>
+
+## Configuration
+
+Preferences live in a TOML file the SETTINGS tab writes for you:
+
+```text
+$XDG_CONFIG_HOME/pi-casso/config.toml
+```
+
+```toml
+[appearance]
+theme = "dark"      # dark | light | mono
+unicode = true      # false falls back to pure ASCII
+max_fps = 30        # upper bound on TUI redraws
+
+[search]
+profile = "balanced"
+match_mode = "emergence"
+width = 12
+height = 12
+canvas_width = 24
+canvas_height = 24
+threshold = 5
+template = "arch"
+
+[paths]
+# export_dir = "/somewhere/else"   # defaults to <data dir>/exports
+```
+
+Every key is optional; anything missing falls back to the built-in default, and
+an unreadable file is reported as a warning rather than being fatal. Unknown
+keys are rejected, because a silently ignored typo is worse than a complaint.
+
+`--no-color`, `NO_COLOR`, and a non-terminal stdout each disable colour without
+discarding your glyph preference. `PI_CASSO_DATA_DIR` relocates the database,
+the π cache, exports, and the config together — which is how the test suite
+keeps out of your real state.
 
 ## Plain output example
 
