@@ -6,6 +6,19 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+/// What the producer behind a growing source is doing right now.
+///
+/// Without this the UI could only say "waiting for more pi", which reads as a
+/// stall. A growing cache is almost never stalled — it is computing, and saying
+/// so (with a rate) is the difference between "stuck" and "working".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GenerationState {
+    /// True while digits are actively being computed.
+    pub active: bool,
+    /// How many digits the producer has been asked to reach in total.
+    pub target_digits: u64,
+}
+
 pub trait DigitSource: Send {
     fn kind(&self) -> &'static str;
     fn len(&self) -> Result<u64>;
@@ -17,6 +30,12 @@ pub trait DigitSource: Send {
 
     fn request_prefetch(&self, _min_digits: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// `None` for sources that cannot grow, so callers can distinguish
+    /// "finite and finished" from "growing and momentarily behind".
+    fn generation(&self) -> Option<GenerationState> {
+        None
     }
 }
 

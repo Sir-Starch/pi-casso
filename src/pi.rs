@@ -151,6 +151,9 @@ pub struct CachedGrowingPiSource {
     cache: PiCache,
     desired_digits: Arc<AtomicU64>,
     stop_prefetch: Arc<AtomicBool>,
+    /// Raised by the background thread while it is actually computing digits,
+    /// so the UI can say "generating" rather than "waiting".
+    generating: Arc<AtomicBool>,
     prefetch_handle: Mutex<Option<JoinHandle<Result<()>>>>,
 }
 
@@ -161,14 +164,17 @@ impl CachedGrowingPiSource {
         let worker_cache = cache.clone();
         let worker_desired = Arc::clone(&desired_digits);
         let worker_stop = Arc::clone(&stop_prefetch);
+        let generating = Arc::new(AtomicBool::new(false));
+        let worker_generating = Arc::clone(&generating);
         let prefetch_handle = thread::spawn(move || {
-            background_prefetch_loop(worker_cache, worker_desired, worker_stop)
+            background_prefetch_loop(worker_cache, worker_desired, worker_stop, worker_generating)
         });
 
         Self {
             cache,
             desired_digits,
             stop_prefetch,
+            generating,
             prefetch_handle: Mutex::new(Some(prefetch_handle)),
         }
     }
@@ -231,22 +237,37 @@ impl DigitSource for CachedGrowingPiSource {
         self.request_min_digits(min_digits);
         Ok(())
     }
+
+    fn generation(&self) -> Option<crate::digits::GenerationState> {
+        Some(crate::digits::GenerationState {
+            active: self.generating.load(Ordering::Acquire),
+            target_digits: self.desired_digits.load(Ordering::Acquire),
+        })
+    }
 }
 
 fn background_prefetch_loop(
     cache: PiCache,
     desired_digits: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    generating: Arc<AtomicBool>,
 ) -> Result<()> {
     while !stop.load(Ordering::Acquire) {
         let desired = desired_digits.load(Ordering::Acquire);
         let current = cache.digit_count()?;
         if desired > current {
-            generate_into_cache(&cache, desired - current, Arc::clone(&stop))?;
+            generating.store(true, Ordering::Release);
+            let result = generate_into_cache(&cache, desired - current, Arc::clone(&stop));
+            // Cleared on the error path too, so a failed generator never leaves
+            // the UI claiming work is in progress.
+            generating.store(false, Ordering::Release);
+            result?;
         } else {
+            generating.store(false, Ordering::Release);
             thread::sleep(Duration::from_millis(20));
         }
     }
+    generating.store(false, Ordering::Release);
     Ok(())
 }
 
