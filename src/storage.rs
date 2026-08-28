@@ -1,14 +1,19 @@
+use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use directories::BaseDirs;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::art::Bitmap;
 use crate::digits::DigitSourceSpec;
+use crate::performance::PerformanceSnapshot;
 use crate::search::{BestMatchDetails, MatchMode, TopMatch};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +96,30 @@ pub struct NewRun {
     pub params_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckpointProgress {
+    pub current_offset: u64,
+    pub scanned_windows: u64,
+    pub best_score: f64,
+    pub best_offset: Option<u64>,
+    pub stop_reason: String,
+    pub checkpoint_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckpointState {
+    pub progress: CheckpointProgress,
+    pub params_json: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("checkpoint transaction failed: {cause}")]
+pub struct CheckpointFailure {
+    pub prior: Option<CheckpointState>,
+    #[source]
+    pub cause: anyhow::Error,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BestEventRecord {
     pub id: i64,
@@ -122,6 +151,32 @@ impl RunRecord {
             bitmap: self.best_bitmap.clone(),
             inverted: self.best_inverted,
             details: self.best_match.clone(),
+        }
+    }
+
+    pub fn checkpoint_state(&self) -> CheckpointState {
+        let checkpoint = serde_json::from_str::<Value>(&self.params_json)
+            .ok()
+            .and_then(|value| value.get("checkpoint").cloned())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        CheckpointState {
+            progress: CheckpointProgress {
+                current_offset: self.current_offset,
+                scanned_windows: self.scanned_windows,
+                best_score: self.best_score,
+                best_offset: self.best_offset,
+                stop_reason: checkpoint
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                checkpoint_sequence: checkpoint
+                    .get("checkpoint_sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            },
+            params_json: self.params_json.clone(),
         }
     }
 }
@@ -346,6 +401,90 @@ impl Storage {
         Ok(())
     }
 
+    pub fn checkpoint_with_snapshot<P, S>(
+        &mut self,
+        run_id: &str,
+        progress: P,
+        performance_snapshot: S,
+    ) -> std::result::Result<CheckpointState, CheckpointFailure>
+    where
+        P: Borrow<CheckpointProgress>,
+        S: Borrow<PerformanceSnapshot>,
+    {
+        let prior = match self.resolve_run(run_id) {
+            Ok(run) => run.checkpoint_state(),
+            Err(cause) => {
+                return Err(CheckpointFailure { prior: None, cause });
+            }
+        };
+        let progress = progress.borrow();
+        let params_json = match merged_checkpoint_params(
+            &prior.params_json,
+            progress,
+            performance_snapshot.borrow(),
+        ) {
+            Ok(params_json) => params_json,
+            Err(cause) => {
+                return Err(CheckpointFailure {
+                    prior: Some(prior),
+                    cause,
+                });
+            }
+        };
+        let updated_at = Utc::now().to_rfc3339();
+        let transaction = match self.conn.transaction() {
+            Ok(transaction) => transaction,
+            Err(cause) => {
+                return Err(CheckpointFailure {
+                    prior: Some(prior),
+                    cause: cause.into(),
+                });
+            }
+        };
+        let result = (|| -> Result<()> {
+            let changed = transaction.execute(
+                r#"
+                UPDATE runs SET
+                    updated_at = ?2,
+                    current_offset = ?3,
+                    scanned_windows = ?4,
+                    best_score = ?5,
+                    best_offset = ?6
+                WHERE id = ?1
+                "#,
+                params![
+                    run_id,
+                    updated_at,
+                    u64_to_i64(progress.current_offset)?,
+                    u64_to_i64(progress.scanned_windows)?,
+                    progress.best_score,
+                    opt_u64_to_i64(progress.best_offset)?,
+                ],
+            )?;
+            if changed != 1 {
+                bail!("run {run_id:?} was not found");
+            }
+            storage_failpoint("after_progress_update")?;
+            transaction.execute(
+                "UPDATE runs SET params_json = ?2 WHERE id = ?1",
+                params![run_id, params_json],
+            )?;
+            storage_failpoint("before_commit")?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(cause) = result {
+            return Err(CheckpointFailure {
+                prior: Some(prior),
+                cause,
+            });
+        }
+        Ok(CheckpointState {
+            progress: progress.clone(),
+            params_json,
+        })
+    }
+
     pub fn insert_best_event(&self, event: &BestEventRecord) -> Result<()> {
         self.conn.execute(
             r#"
@@ -445,6 +584,79 @@ impl Storage {
         self.conn
             .execute("DELETE FROM runs WHERE id = ?1", [&run.id])?;
         Ok(run)
+    }
+}
+
+fn merged_checkpoint_params(
+    prior_params_json: &str,
+    progress: &CheckpointProgress,
+    performance_snapshot: &PerformanceSnapshot,
+) -> Result<String> {
+    let mut params = serde_json::from_str::<Value>(prior_params_json)
+        .context("persisted run parameters are not valid JSON")?;
+    let object = params
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("persisted run parameters must be a JSON object"))?;
+    let mut snapshot = performance_snapshot.encode_value();
+    if let (Some(existing), Some(incoming)) = (
+        object
+            .get("performance_snapshot")
+            .and_then(Value::as_object),
+        snapshot.as_object_mut(),
+    ) {
+        for (key, value) in existing {
+            incoming.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    object.insert("performance_snapshot".to_string(), snapshot);
+    object.insert(
+        "checkpoint".to_string(),
+        json!({
+            "current_offset": progress.current_offset,
+            "scanned_windows": progress.scanned_windows,
+            "best_score": progress.best_score,
+            "best_offset": progress.best_offset,
+            "stop_reason": progress.stop_reason,
+            "checkpoint_sequence": progress.checkpoint_sequence,
+        }),
+    );
+    Ok(serde_json::to_string(&params)?)
+}
+
+fn storage_failpoint(phase: &str) -> Result<()> {
+    let environment_match = crate::gpu_ring::test_mode_enabled()
+        && std::env::var("PI_CASSO_TEST_STORAGE_FAIL_PHASE")
+            .ok()
+            .as_deref()
+            == Some(phase);
+    #[cfg(test)]
+    let test_match = test_storage_failpoint_is(phase);
+    #[cfg(not(test))]
+    let test_match = false;
+    if environment_match || test_match {
+        bail!("injected storage failure at {phase}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static TEST_STORAGE_FAIL_PHASE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_storage_failpoint_is(phase: &str) -> bool {
+    TEST_STORAGE_FAIL_PHASE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .is_ok_and(|value| value.as_deref() == Some(phase))
+}
+
+#[cfg(test)]
+fn set_test_storage_failpoint(phase: Option<&str>) {
+    if let Ok(mut value) = TEST_STORAGE_FAIL_PHASE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *value = phase.map(str::to_string);
     }
 }
 
@@ -652,6 +864,89 @@ mod tests {
         let loaded = storage.resolve_run("test").unwrap();
         assert_eq!(loaded.current_offset, 9);
         assert_eq!(loaded.scanned_windows, 5);
+    }
+
+    #[test]
+    fn checkpoint_with_snapshot_rolls_back_progress_and_params_on_write_failure() {
+        // Given: a persisted run with a prior parameter payload and checkpoint state.
+        let dir = tempdir().unwrap();
+        let mut storage = Storage::open_path(dir.path().join("state.db")).unwrap();
+        let target = Bitmap::new(2, 2, vec![0, 1, 1, 0]).unwrap();
+        let run = storage
+            .create_run(NewRun {
+                name: "atomic".to_string(),
+                source: DigitSourceSpec::demo(),
+                template_name: None,
+                art_hash: target.sha256(),
+                width: 2,
+                height: 2,
+                canvas_width: 2,
+                canvas_height: 2,
+                match_mode: MatchMode::Threshold,
+                threshold: 5,
+                invert_enabled: false,
+                start_offset: Some(3),
+                target_bitmap: target,
+                generated_digit_count: 0,
+                params_json: serde_json::json!({
+                    "legacy": {"keep": true},
+                    "checkpoint": {
+                        "current_offset": 3,
+                        "scanned_windows": 1,
+                        "best_score": 0.25,
+                        "best_offset": null,
+                        "stop_reason": "paused",
+                        "checkpoint_sequence": 4
+                    }
+                })
+                .to_string(),
+            })
+            .unwrap();
+        let before = storage.resolve_run(&run.id).unwrap();
+        let settings = crate::performance::PerformanceSettings::from_profile(
+            crate::performance::PerformanceProfile::Performance,
+            crate::performance::SearchBackendChoice::Cpu,
+            crate::performance::GeneratorBackendChoice::Cpu,
+            crate::performance::GpuMode::Off,
+            None,
+            crate::performance::ThermalMode::Normal,
+            false,
+            true,
+            MatchMode::Threshold,
+            crate::performance::PerformanceOverrides::default(),
+        );
+        let snapshot = crate::performance::PerformanceSnapshot::from_settings(
+            settings,
+            Some(9),
+            Some(20),
+            None,
+        );
+        let progress = CheckpointProgress {
+            current_offset: 9,
+            scanned_windows: 7,
+            best_score: 0.75,
+            best_offset: Some(8),
+            stop_reason: "work_windows".to_string(),
+            checkpoint_sequence: 5,
+        };
+
+        // When: either transaction failpoint fires after the progress write begins.
+        for phase in ["after_progress_update", "before_commit"] {
+            set_test_storage_failpoint(Some(phase));
+            let failure = storage
+                .checkpoint_with_snapshot(&run.id, &progress, &snapshot)
+                .expect_err("the injected storage failure must abort the transaction");
+            set_test_storage_failpoint(None);
+
+            // Then: both the six-field progress tuple and the raw parameter bytes are unchanged.
+            let after = storage.resolve_run(&run.id).unwrap();
+            assert_eq!(after.current_offset, before.current_offset);
+            assert_eq!(after.scanned_windows, before.scanned_windows);
+            assert_eq!(after.best_score, before.best_score);
+            assert_eq!(after.best_offset, before.best_offset);
+            assert_eq!(after.params_json, before.params_json);
+            assert_eq!(failure.prior.as_ref(), Some(&before.checkpoint_state()));
+        }
     }
 
     #[test]

@@ -1,12 +1,10 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use num_bigint::BigInt;
@@ -14,10 +12,23 @@ use num_traits::{One, ToPrimitive, Zero};
 #[cfg(not(target_env = "msvc"))]
 use rug::{Integer, ops::Pow};
 
-use crate::digits::{DigitSource, convert_ascii_digits};
+use crate::digits::DigitRead;
+
+mod cache_publication;
+mod generator_backend;
+mod generator_discovery;
+mod producer;
+mod y_cruncher;
+
+pub(crate) use generator_backend::{GeneratorSelection, UnavailableGenerator, resolve_generator};
+pub use producer::CachedGrowingPiSource;
+pub(crate) use producer::GENERATOR_FIXED_BYTES;
+#[cfg(test)]
+use producer::GenerationBackend;
+pub(crate) use producer::{GenerationBudget, GenerationPermit};
+pub use producer::{GenerationDemand, GenerationMetrics, GenerationPlan};
 
 pub const DEFAULT_GENERATE_CHUNK: usize = 10_000;
-pub const ON_DEMAND_CACHE_LEAD: u64 = 10_000;
 
 #[cfg(not(target_env = "msvc"))]
 const CHUDNOVSKY_DIGITS_PER_TERM: f64 = 14.181_647_462_725_477;
@@ -37,6 +48,11 @@ pub struct PiCacheInfo {
     pub path: PathBuf,
     pub digits: u64,
     pub bytes: u64,
+    pub published_digits: u64,
+    pub raw_file_size: u64,
+    pub published_prefix_sha256: String,
+    pub valid_ascii: bool,
+    pub sidecar_status: String,
 }
 
 impl PiCache {
@@ -64,58 +80,62 @@ impl PiCache {
 
     pub fn info(&self) -> Result<PiCacheInfo> {
         self.ensure_parent()?;
-        let bytes = match std::fs::metadata(&self.path) {
-            Ok(metadata) => metadata.len(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to stat {}", self.path.display()));
-            }
-        };
+        let snapshot = cache_publication::info(&self.path)?;
         Ok(PiCacheInfo {
             path: self.path.clone(),
-            digits: bytes,
-            bytes,
+            digits: snapshot.digits,
+            bytes: snapshot.raw_file_size,
+            published_digits: snapshot.published_digits,
+            raw_file_size: snapshot.raw_file_size,
+            published_prefix_sha256: snapshot.published_prefix_sha256,
+            valid_ascii: snapshot.valid_ascii,
+            sidecar_status: snapshot.sidecar_status.to_owned(),
         })
+    }
+
+    pub fn validate_reset_lock(&self) -> Result<()> {
+        cache_publication::validate_reset_lock(&self.path)
     }
 
     pub fn digit_count(&self) -> Result<u64> {
         Ok(self.info()?.digits)
     }
 
-    pub fn append_digits(&self, digits: &[u8]) -> Result<()> {
-        if digits.iter().any(|digit| *digit > 9) {
-            bail!("pi cache append received a non-digit value");
-        }
+    pub(crate) fn published_digit_count(&self) -> Result<u64> {
         self.ensure_parent()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open pi cache {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        for digit in digits {
-            writer.write_all(&[b'0' + *digit])?;
-        }
-        writer.flush()?;
-        Ok(())
+        cache_publication::published_digit_count(&self.path)
+    }
+
+    pub fn append_digits(&self, digits: &[u8]) -> Result<()> {
+        self.ensure_parent()?;
+        cache_publication::append_digits(&self.path, digits)
+    }
+
+    pub fn append_from_validated_source(&self, source: &std::path::Path) -> Result<u64> {
+        self.ensure_parent()?;
+        cache_publication::append_from_validated_source(&self.path, source)
+    }
+
+    pub fn replace_from_validated_source(&self, source: &std::path::Path) -> Result<u64> {
+        self.ensure_parent()?;
+        cache_publication::replace_from_validated_source(&self.path, source)
+    }
+
+    pub fn repair_publication(&self) -> Result<()> {
+        self.ensure_parent()?;
+        cache_publication::repair_publication(&self.path)
+    }
+
+    fn with_publication_writer<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        cache_publication::lock::with_exclusive(&self.path, operation)
     }
 
     pub fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to open {}", self.path.display()));
-            }
-        };
-        file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = vec![0_u8; len];
-        let read = file.read(&mut bytes)?;
-        bytes.truncate(read);
-        convert_ascii_digits(&bytes)
+        Ok(self.read_range_timed(offset, len)?.digits)
+    }
+
+    pub fn read_range_timed(&self, offset: u64, len: usize) -> Result<DigitRead> {
+        cache_publication::read_range_timed(&self.path, offset, len)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -145,130 +165,6 @@ impl PiCache {
         }
         Ok(())
     }
-}
-
-pub struct CachedGrowingPiSource {
-    cache: PiCache,
-    desired_digits: Arc<AtomicU64>,
-    stop_prefetch: Arc<AtomicBool>,
-    /// Raised by the background thread while it is actually computing digits,
-    /// so the UI can say "generating" rather than "waiting".
-    generating: Arc<AtomicBool>,
-    prefetch_handle: Mutex<Option<JoinHandle<Result<()>>>>,
-}
-
-impl CachedGrowingPiSource {
-    pub fn new(cache: PiCache) -> Self {
-        let desired_digits = Arc::new(AtomicU64::new(0));
-        let stop_prefetch = Arc::new(AtomicBool::new(false));
-        let worker_cache = cache.clone();
-        let worker_desired = Arc::clone(&desired_digits);
-        let worker_stop = Arc::clone(&stop_prefetch);
-        let generating = Arc::new(AtomicBool::new(false));
-        let worker_generating = Arc::clone(&generating);
-        let prefetch_handle = thread::spawn(move || {
-            background_prefetch_loop(worker_cache, worker_desired, worker_stop, worker_generating)
-        });
-
-        Self {
-            cache,
-            desired_digits,
-            stop_prefetch,
-            generating,
-            prefetch_handle: Mutex::new(Some(prefetch_handle)),
-        }
-    }
-
-    fn request_min_digits(&self, min_digits: u64) {
-        let mut current = self.desired_digits.load(Ordering::Acquire);
-        while min_digits > current {
-            match self.desired_digits.compare_exchange_weak(
-                current,
-                min_digits,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
-impl Drop for CachedGrowingPiSource {
-    fn drop(&mut self) {
-        self.stop_prefetch.store(true, Ordering::Release);
-        if let Ok(mut handle) = self.prefetch_handle.lock() {
-            if let Some(handle) = handle.take() {
-                if handle.is_finished() {
-                    let _ = handle.join();
-                }
-            }
-        }
-    }
-}
-
-impl DigitSource for CachedGrowingPiSource {
-    fn kind(&self) -> &'static str {
-        "cache"
-    }
-
-    fn len(&self) -> Result<u64> {
-        self.cache.digit_count()
-    }
-
-    fn validate(&self) -> Result<()> {
-        self.cache.validate()
-    }
-
-    fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let required_digits = offset
-            .checked_add(len as u64)
-            .ok_or_else(|| anyhow!("requested pi range overflowed"))?;
-        self.request_min_digits(required_digits.saturating_add(ON_DEMAND_CACHE_LEAD));
-        self.cache.read_range(offset, len)
-    }
-
-    fn is_growing(&self) -> bool {
-        true
-    }
-
-    fn request_prefetch(&self, min_digits: u64) -> Result<()> {
-        self.request_min_digits(min_digits);
-        Ok(())
-    }
-
-    fn generation(&self) -> Option<crate::digits::GenerationState> {
-        Some(crate::digits::GenerationState {
-            active: self.generating.load(Ordering::Acquire),
-            target_digits: self.desired_digits.load(Ordering::Acquire),
-        })
-    }
-}
-
-fn background_prefetch_loop(
-    cache: PiCache,
-    desired_digits: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    generating: Arc<AtomicBool>,
-) -> Result<()> {
-    while !stop.load(Ordering::Acquire) {
-        let desired = desired_digits.load(Ordering::Acquire);
-        let current = cache.digit_count()?;
-        if desired > current {
-            generating.store(true, Ordering::Release);
-            let result = generate_into_cache(&cache, desired - current, Arc::clone(&stop));
-            // Cleared on the error path too, so a failed generator never leaves
-            // the UI claiming work is in progress.
-            generating.store(false, Ordering::Release);
-            result?;
-        } else {
-            generating.store(false, Ordering::Release);
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-    generating.store(false, Ordering::Release);
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -369,20 +265,38 @@ impl SpigotState {
     }
 }
 
-pub fn generate_into_cache(cache: &PiCache, digits: u64, stop: Arc<AtomicBool>) -> Result<u64> {
-    let _guard = generation_guard()?;
-    generate_into_cache_unlocked(cache, digits, stop)
-}
-
-fn generate_into_cache_unlocked(
+pub(crate) fn generate_with_selection(
     cache: &PiCache,
     digits: u64,
-    stop: Arc<AtomicBool>,
+    selection: &GeneratorSelection,
+    workers: usize,
 ) -> Result<u64> {
-    generate_into_cache_fast(cache, digits, stop.clone()).or_else(|fast_err| {
-        eprintln!("warning: fast pi generator failed; falling back to spigot: {fast_err:#}");
-        generate_into_cache_spigot(cache, digits, stop)
-    })
+    match selection.selected_variant {
+        Some(generator_backend::GeneratorVariant::Chudnovsky) => {
+            cache.with_publication_writer(|| {
+                let _guard = generation_guard()?;
+                generate_into_cache_fast(cache, digits, Arc::new(AtomicBool::new(false)))
+            })
+        }
+        Some(generator_backend::GeneratorVariant::Spigot) => cache.with_publication_writer(|| {
+            let _guard = generation_guard()?;
+            generate_into_cache_spigot(cache, digits, Arc::new(AtomicBool::new(false)))
+        }),
+        Some(generator_backend::GeneratorVariant::YCruncher) => {
+            let executable = selection
+                .executable
+                .as_ref()
+                .ok_or_else(|| anyhow!(selection.reason.clone()))?;
+            let target = cache
+                .digit_count()?
+                .checked_add(digits)
+                .ok_or_else(|| anyhow!("requested pi cache size overflowed"))?;
+            y_cruncher::generate_to_target(cache, target, executable, workers)
+                .map(|generation| generation.generated_digits)
+                .map_err(|failure| anyhow!(failure.as_str()))
+        }
+        None => Err(anyhow!(selection.reason.clone())),
+    }
 }
 
 fn generation_guard() -> Result<std::sync::MutexGuard<'static, ()>> {
@@ -390,6 +304,26 @@ fn generation_guard() -> Result<std::sync::MutexGuard<'static, ()>> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| anyhow!("pi generation lock was poisoned"))
+}
+
+pub(super) fn generation_guard_with_stop(
+    stop: &AtomicBool,
+) -> Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Err(anyhow!("pi generation was cancelled"));
+        }
+
+        match PI_GENERATION_LOCK.get_or_init(|| Mutex::new(())).try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(anyhow!("pi generation lock was poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
 }
 
 fn generate_into_cache_spigot(cache: &PiCache, digits: u64, stop: Arc<AtomicBool>) -> Result<u64> {
@@ -434,13 +368,23 @@ fn generate_into_cache_fast(cache: &PiCache, digits: u64, stop: Arc<AtomicBool>)
 
 #[cfg(not(target_env = "msvc"))]
 pub fn chudnovsky_pi_digits(digits: usize) -> Result<Vec<u8>> {
+    chudnovsky_pi_digits_with_parallelism(digits, true)
+}
+
+#[cfg(not(target_env = "msvc"))]
+pub(crate) fn chudnovsky_pi_digits_sequential(digits: usize) -> Result<Vec<u8>> {
+    chudnovsky_pi_digits_with_parallelism(digits, false)
+}
+
+#[cfg(not(target_env = "msvc"))]
+fn chudnovsky_pi_digits_with_parallelism(digits: usize, parallel: bool) -> Result<Vec<u8>> {
     if digits == 0 {
         return Ok(Vec::new());
     }
     let guard_digits = 8usize;
     let scale_digits = digits + guard_digits;
     let terms = ((scale_digits as f64 / CHUDNOVSKY_DIGITS_PER_TERM).ceil() as u64 + 2).max(2);
-    let (_p, q, t) = chudnovsky_bs_gmp(0, terms);
+    let (_p, q, t) = chudnovsky_bs_gmp(0, terms, parallel);
     if t == 0 {
         bail!("pi generator produced a zero Chudnovsky sum");
     }
@@ -473,8 +417,13 @@ pub fn chudnovsky_pi_digits(_digits: usize) -> Result<Vec<u8>> {
     );
 }
 
+#[cfg(target_env = "msvc")]
+pub(crate) fn chudnovsky_pi_digits_sequential(digits: usize) -> Result<Vec<u8>> {
+    chudnovsky_pi_digits(digits)
+}
+
 #[cfg(not(target_env = "msvc"))]
-fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
+fn chudnovsky_bs_gmp(a: u64, b: u64, parallel: bool) -> (Integer, Integer, Integer) {
     if b - a == 1 {
         if a == 0 {
             return (
@@ -496,10 +445,16 @@ fn chudnovsky_bs_gmp(a: u64, b: u64) -> (Integer, Integer, Integer) {
     }
 
     let mid = (a + b) / 2;
-    let (left, right) = if b - a >= CHUDNOVSKY_PARALLEL_THRESHOLD {
-        rayon::join(|| chudnovsky_bs_gmp(a, mid), || chudnovsky_bs_gmp(mid, b))
+    let (left, right) = if parallel && b - a >= CHUDNOVSKY_PARALLEL_THRESHOLD {
+        rayon::join(
+            || chudnovsky_bs_gmp(a, mid, true),
+            || chudnovsky_bs_gmp(mid, b, true),
+        )
     } else {
-        (chudnovsky_bs_gmp(a, mid), chudnovsky_bs_gmp(mid, b))
+        (
+            chudnovsky_bs_gmp(a, mid, parallel),
+            chudnovsky_bs_gmp(mid, b, parallel),
+        )
     };
     let (p1, q1, t1) = left;
     let (p2, q2, t2) = right;
@@ -515,7 +470,10 @@ pub fn cache_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::atomic::AtomicBool;
+
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -542,4 +500,42 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    #[cfg(not(target_env = "msvc"))]
+    fn sequential_chudnovsky_matches_parallel_generation() {
+        // Given: a target large enough to cross the parallel binary-split threshold.
+        let target = 1_024;
+
+        // When: the direct sequential and Rayon-capable generators compute the same prefix.
+        let sequential = chudnovsky_pi_digits_sequential(target).unwrap();
+        let parallel = chudnovsky_pi_digits(target).unwrap();
+
+        // Then: scheduling does not change the generated digits.
+        assert_eq!(sequential, parallel);
+    }
+
+    #[test]
+    fn validated_continuation_rejects_mismatching_prefix_without_mutation() {
+        let directory = tempdir().unwrap();
+        let cache = PiCache::new(directory.path().join("pi-cache.txt"));
+        cache.append_digits(&[3, 1, 4, 1, 5]).unwrap();
+        let raw_before = fs::read(cache.path()).unwrap();
+        let sidecar = directory.path().join("pi-cache.digits.json");
+        let sidecar_before = fs::read(&sidecar).unwrap();
+        let source = directory.path().join("continuation.txt");
+        fs::write(&source, b"2718281828").unwrap();
+
+        let error = cache
+            .append_from_validated_source(&source)
+            .expect_err("mismatching continuation must be rejected");
+
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(fs::read(cache.path()).unwrap(), raw_before);
+        assert_eq!(fs::read(sidecar).unwrap(), sidecar_before);
+    }
 }
+
+#[cfg(test)]
+#[path = "pi/producer_tests.rs"]
+mod producer_tests;

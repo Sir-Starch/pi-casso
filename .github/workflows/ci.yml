@@ -30,8 +30,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Compile tests
+        run: cargo test --workspace --all-targets --all-features --locked --no-run
 
       - name: Build release
         run: cargo build --release --locked
@@ -47,8 +47,8 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets --all-features --locked
 
-      - name: Test
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Compile tests
+        run: cargo test --workspace --all-targets --all-features --locked --no-run
 
   windows:
     name: Windows Stable
@@ -61,8 +61,8 @@ jobs:
       - name: Check
         run: cargo check --workspace --all-targets --all-features --locked
 
-      - name: Test
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Compile tests
+        run: cargo test --workspace --all-targets --all-features --locked --no-run
 
       - name: Build release
         run: cargo build --release --locked

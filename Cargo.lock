@@ -463,6 +463,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d5be1e9776a20360ca270df637b391c85d48ea57508140f30a4e8f6da91884a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1294,6 +1303,7 @@ dependencies = [
  "clap",
  "crossterm",
  "ctrlc",
+ "cudarc",
  "directories",
  "libc",
  "num-bigint",
@@ -1312,6 +1322,7 @@ dependencies = [
  "toml",
  "uuid",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

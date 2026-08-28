@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -30,7 +31,8 @@ use crate::tui::widgets::{
     Hint, MIN_HEIGHT, MIN_WIDTH, RowRegion, dim_line, modal_area, move_selection, panel,
     render_status_bar, render_tab_bar, render_toasts, render_too_small,
 };
-use crate::tui::worker::{SearchWorker, WorkerEvent};
+use crate::tui::worker::{SearchWorker, WorkerEvent, WorkerHandoffMarker};
+use crate::tui::{FramePolicy, PreparedResume, TuiLaunch};
 
 /// How many speed samples the sparkline keeps. At the default refresh this is
 /// roughly the last minute of the hunt.
@@ -73,10 +75,33 @@ pub struct App {
     pub should_quit: bool,
     /// Set whenever something changed that the screen has not shown yet.
     pub dirty: bool,
+    pending_launch: Option<PreparedResume>,
+    frame_policy: FramePolicy,
+    resume_handoff: Option<ResumeHandoff>,
+    handoff_full_redraw: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResumeHandoff {
+    pub run_id: String,
+    pub resume_state_restored: bool,
+    pub event_loop_handoff: bool,
+    pub max_fps: u32,
+    pub ui_refresh_ms: u64,
+    pub backend: &'static str,
+    pub queue_depth: usize,
+    pub stop_reason: String,
+    pub worker_receipt: Option<WorkerHandoffMarker>,
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(config: Config, theme: Theme) -> Self {
+        Self::new_with_launch(config, theme, TuiLaunch::default())
+    }
+
+    pub fn new_with_launch(config: Config, theme: Theme, launch: TuiLaunch) -> Self {
+        let frame_policy = FramePolicy::new(config.appearance.max_fps, 500);
         let mut app = Self {
             hunt: HuntTab::new(&config),
             settings: SettingsTab::new(&config),
@@ -95,10 +120,15 @@ impl App {
             regions: Regions::default(),
             should_quit: false,
             dirty: true,
+            pending_launch: launch.prepared_resume,
+            frame_policy,
+            resume_handoff: None,
+            handoff_full_redraw: false,
         };
         if let Err(err) = app.runs.reload() {
             app.toasts.error(format!("could not load runs: {err:#}"));
         }
+        app.consume_pending_launch();
         app
     }
 
@@ -109,8 +139,17 @@ impl App {
         }
     }
 
-    pub fn max_fps(&self) -> u32 {
-        self.config.appearance.max_fps.clamp(1, 120)
+    pub(crate) const fn frame_policy(&self) -> FramePolicy {
+        self.frame_policy
+    }
+
+    #[cfg(test)]
+    pub fn resume_handoff(&self) -> Option<&ResumeHandoff> {
+        self.resume_handoff.as_ref()
+    }
+
+    pub(crate) fn take_handoff_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.handoff_full_redraw)
     }
 
     // ---------------------------------------------------------------- input
@@ -120,6 +159,14 @@ impl App {
 
         // Ctrl+C is the one binding that must work from inside every modal.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.request_quit();
+            return;
+        }
+        if self.resume_handoff.is_some()
+            && self.worker.is_some()
+            && key.modifiers == KeyModifiers::NONE
+            && key.code == KeyCode::Char('q')
+        {
             self.request_quit();
             return;
         }
@@ -650,16 +697,27 @@ impl App {
             self.toasts.warn("a search is already running");
             return;
         }
-        match self.hunt.build() {
-            Ok((run, options)) => {
-                self.speed_history.clear();
-                self.toasts.success(format!("hunting: {}", run.name));
-                self.worker = Some(SearchWorker::start(run, options));
-                self.tab = Tab::Hunt;
-            }
+        match self.try_start_search() {
+            Ok(()) => {}
             // The exact case that used to terminate the application.
             Err(err) => self.toasts.error(format!("{err:#}")),
         }
+    }
+
+    fn try_start_search(&mut self) -> Result<()> {
+        let start = self.hunt.start_spec()?;
+        let capability = start.resolve_preflight()?;
+        let prepared = self.hunt.build(start, capability)?;
+        self.frame_policy = FramePolicy::new(
+            prepared.options.performance.limits.max_fps,
+            prepared.options.performance.limits.ui_refresh_ms,
+        );
+        self.speed_history.clear();
+        self.toasts
+            .success(format!("hunting: {}", prepared.run.name));
+        self.worker = Some(SearchWorker::start_prepared_start(prepared));
+        self.tab = Tab::Hunt;
+        Ok(())
     }
 
     fn resume_selected(&mut self) {
@@ -667,10 +725,6 @@ impl App {
             self.toasts.warn("no run selected");
             return;
         };
-        self.resume(run);
-    }
-
-    fn resume(&mut self, run: RunRecord) {
         if self.worker.is_some() {
             self.toasts.warn("stop the running search first");
             return;
@@ -679,10 +733,56 @@ impl App {
             self.toasts.warn(reason);
             return;
         }
-        let options = hunt::resume_options(&run);
+        let prepared = (|| -> Result<PreparedResume> {
+            let mut storage = Storage::open_default()?;
+            crate::commands::prepare_resume_selected(&run, &mut storage)
+        })();
+        match prepared {
+            Ok(prepared) => self.start_prepared_resume(prepared),
+            Err(err) => self.toasts.error(format!("{err:#}")),
+        }
+    }
+
+    pub fn consume_pending_launch(&mut self) {
+        let Some(prepared) = self.pending_launch.take() else {
+            return;
+        };
+        self.start_prepared_resume(prepared);
+    }
+
+    pub fn start_prepared_resume(&mut self, prepared: PreparedResume) {
+        if self.worker.is_some() {
+            self.toasts.warn("stop the running search first");
+            return;
+        }
+        self.frame_policy = FramePolicy::from_prepared_resume(&prepared);
         self.speed_history.clear();
-        self.toasts.success(format!("resuming {}", run.name));
-        self.worker = Some(SearchWorker::start(run, options));
+        self.toasts
+            .success(format!("resuming {}", prepared.run.name));
+        let run_id = prepared.run.id.clone();
+        let max_fps = prepared.snapshot.settings.limits.max_fps;
+        let ui_refresh_ms = prepared.snapshot.settings.limits.ui_refresh_ms;
+        let backend = prepared
+            .capability
+            .resolved
+            .unwrap_or(prepared.options.performance.backend.as_str());
+        let queue_depth = prepared.snapshot.settings.limits.queue_depth;
+        let stop_reason = prepared.run.checkpoint_state().progress.stop_reason;
+        let worker = SearchWorker::start_prepared(prepared);
+        let worker_receipt = worker.prepared_handoff_marker();
+        self.resume_handoff = Some(ResumeHandoff {
+            run_id,
+            resume_state_restored: true,
+            event_loop_handoff: true,
+            max_fps,
+            ui_refresh_ms,
+            backend,
+            queue_depth,
+            stop_reason,
+            worker_receipt,
+        });
+        self.handoff_full_redraw = true;
+        self.worker = Some(worker);
         self.tab = Tab::Hunt;
     }
 
@@ -862,7 +962,17 @@ impl App {
             Tab::Hunt => match &self.worker {
                 Some(worker) => {
                     let history: Vec<u64> = self.speed_history.iter().copied().collect();
-                    hunt::draw_dashboard(frame, rows[1], worker.latest.as_ref(), &history, &theme);
+                    let dashboard_area = self
+                        .resume_handoff
+                        .as_ref()
+                        .map_or(rows[1], |_| resume_dashboard_areas(rows[1])[1]);
+                    hunt::draw_dashboard(
+                        frame,
+                        dashboard_area,
+                        worker.latest.as_ref(),
+                        &history,
+                        &theme,
+                    );
                 }
                 None => regions.form = Some(self.hunt.draw_wizard(frame, rows[1], &theme)),
             },
@@ -882,6 +992,46 @@ impl App {
         }
         regions.palette = self.draw_palette(frame, area);
         render_toasts(frame, rows[1], &self.toasts, &theme);
+        if let Some(handoff) = &self.resume_handoff {
+            let mut handoff_lines = vec![
+                Line::from(format!(
+                    "resume_state_restored={} event_loop_handoff={}",
+                    handoff.resume_state_restored, handoff.event_loop_handoff
+                )),
+                Line::from(format!("resume_run_id={}", handoff.run_id)),
+                Line::from(format!(
+                    "max_fps={} ui_refresh_ms={} backend={} queue={}",
+                    handoff.max_fps, handoff.ui_refresh_ms, handoff.backend, handoff.queue_depth
+                )),
+                Line::from(format!("wait=ready stop_reason={}", handoff.stop_reason)),
+            ];
+            handoff_lines.push(Line::from(handoff.worker_receipt.as_ref().map_or_else(
+                || "worker_handoff_received=false".to_string(),
+                WorkerHandoffMarker::telemetry_marker,
+            )));
+            if let Some(receipt) = &handoff.worker_receipt {
+                handoff_lines.extend([
+                    Line::from(format!(
+                        "worker_snapshot_sha256={}",
+                        receipt.snapshot_sha256
+                    )),
+                    Line::from(format!(
+                        "worker_capability_sha256={}",
+                        receipt.capability_sha256
+                    )),
+                    Line::from(format!(
+                        "worker_capability_status={} worker_capability_requested={} worker_capability_resolved={}",
+                        receipt.capability_status,
+                        receipt.capability_requested,
+                        receipt.capability_resolved.unwrap_or("none")
+                    )),
+                ]);
+            }
+            frame.render_widget(
+                Paragraph::new(handoff_lines).style(theme.dim_style()),
+                resume_dashboard_areas(rows[1])[0],
+            );
+        }
         self.regions = regions;
     }
 
@@ -1141,6 +1291,13 @@ impl App {
     }
 }
 
+fn resume_dashboard_areas(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(6)])
+        .split(area)
+}
+
 /// Exports go to a directory the app owns, not to whatever the working
 /// directory happened to be when the TUI was launched.
 fn export_run(run: &RunRecord, config: &Config) -> anyhow::Result<std::path::PathBuf> {
@@ -1184,6 +1341,24 @@ fn sanitize_filename(value: &str) -> String {
 mod tests {
     use super::*;
 
+    struct StartFailpointGuard;
+
+    impl StartFailpointGuard {
+        fn unavailable_wgpu() -> Self {
+            hunt::test_force_start_wgpu_unavailable(true);
+            hunt::test_fail_if_source_open(true);
+            crate::tui::worker::test_reset_worker_start_count();
+            Self
+        }
+    }
+
+    impl Drop for StartFailpointGuard {
+        fn drop(&mut self) {
+            hunt::test_force_start_wgpu_unavailable(false);
+            hunt::test_fail_if_source_open(false);
+        }
+    }
+
     #[test]
     fn filenames_lose_path_separators_and_spaces() {
         assert_eq!(sanitize_filename("arch eternal"), "arch-eternal");
@@ -1195,5 +1370,46 @@ mod tests {
     fn a_name_of_only_punctuation_still_yields_a_filename() {
         assert_eq!(sanitize_filename("///"), "run");
         assert_eq!(sanitize_filename(""), "run");
+    }
+
+    #[test]
+    fn tui_start_preflight_rejects_before_digit_source() {
+        // Given: normal TUI form start explicitly requests an unavailable GPU,
+        // with source-open and worker-start tripwires observing later phases.
+        let _failpoints = StartFailpointGuard::unavailable_wgpu();
+        let config = Config::default();
+        let theme = config.theme(true);
+        let mut app = App::new(config, theme);
+        app.hunt.form.set_choice(hunt::WizardField::Gpu, 2);
+
+        // When: the normal form start path resolves current-host preflight.
+        let error = app.try_start_search().unwrap_err();
+
+        // Then: the typed capability failure is returned before all side effects.
+        let typed = error
+            .downcast_ref::<crate::search::BackendSelectionError>()
+            .unwrap();
+        let source_open_count = hunt::test_source_open_count();
+        let worker_start_count = crate::tui::worker::test_worker_start_count();
+        let event_loop_handoff = app
+            .resume_handoff()
+            .is_some_and(|handoff| handoff.event_loop_handoff);
+        assert_eq!(typed.status, "unsupported");
+        assert_eq!(typed.requested_backend, "wgpu");
+        assert_eq!(source_open_count, 0);
+        assert_eq!(worker_start_count, 0);
+        assert!(app.worker.is_none());
+        assert!(!event_loop_handoff);
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": typed.status,
+                "requested_backend": typed.requested_backend,
+                "source_open_count": source_open_count,
+                "worker_start_count": worker_start_count,
+                "worker_present": app.worker.is_some(),
+                "event_loop_handoff": event_loop_handoff,
+            })
+        );
     }
 }

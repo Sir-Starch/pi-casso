@@ -13,6 +13,7 @@ use crate::storage::{BestEventRecord, RunRecord};
 #[derive(Clone, Debug)]
 pub struct SearchOptions {
     pub max_offset: Option<u64>,
+    pub work_windows: Option<u64>,
     pub limit: Option<u64>,
     pub match_mode: MatchMode,
     pub canvas_width: usize,
@@ -25,6 +26,50 @@ pub struct SearchOptions {
     pub keep_going_after_perfect: bool,
     pub chunk_windows: usize,
     pub performance: PerformanceSettings,
+}
+
+impl SearchOptions {
+    pub const fn intersect_count_bounds(
+        work_windows: Option<u64>,
+        limit: Option<u64>,
+    ) -> Option<u64> {
+        match (work_windows, limit) {
+            (Some(work_windows), Some(limit)) => Some(if work_windows < limit {
+                work_windows
+            } else {
+                limit
+            }),
+            (Some(work_windows), None) => Some(work_windows),
+            (None, Some(limit)) => Some(limit),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, thiserror::Error)]
+#[error("snapshot_incompatible: {reason}")]
+pub struct SnapshotIncompatible {
+    pub status: &'static str,
+    pub reason: String,
+    pub snapshot_schema_version: Option<u64>,
+}
+
+impl SnapshotIncompatible {
+    pub fn new(reason: impl Into<String>, snapshot_schema_version: Option<u64>) -> Self {
+        Self {
+            status: "snapshot_incompatible",
+            reason: reason.into(),
+            snapshot_schema_version,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, thiserror::Error)]
+#[error("{status}: {reason}")]
+pub struct BackendSelectionError {
+    pub status: &'static str,
+    pub reason: String,
+    pub requested_backend: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,16 +189,28 @@ pub trait SearchReporter {
     fn on_finish(&mut self, snapshot: &SearchSnapshot, reason: FinishReason) -> Result<()>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmergenceStatistics {
+    pub(crate) covered: usize,
+    pub(crate) total: usize,
+    pub(crate) leaked: usize,
+    pub(crate) background_total: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowScore {
     pub(crate) index: usize,
     pub(crate) score: f64,
+    pub(crate) score_q: u32,
     pub(crate) inverted: bool,
     pub(crate) digit: Option<u8>,
     pub(crate) x: Option<usize>,
     pub(crate) y: Option<usize>,
     pub(crate) coverage: Option<f64>,
     pub(crate) leakage: Option<f64>,
+    pub(crate) coverage_q: Option<u32>,
+    pub(crate) leakage_q: Option<u32>,
+    pub(crate) statistics: Option<EmergenceStatistics>,
 }
 
 impl WindowScore {
@@ -163,12 +220,16 @@ impl WindowScore {
         Self {
             index,
             score: 0.0,
+            score_q: 0,
             inverted: false,
             digit: Some(0),
             x: Some(0),
             y: Some(0),
             coverage: Some(0.0),
             leakage: Some(0.0),
+            coverage_q: Some(0),
+            leakage_q: Some(0),
+            statistics: None,
         }
     }
 }

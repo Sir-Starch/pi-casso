@@ -6,18 +6,31 @@
 //! Those call sites are now `session.snapshot()` and `session.finish(...)`, and
 //! adding a field no longer means editing eighteen argument lists.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
+use crate::benchmark_report::{MemoryReport, QueueReport, ReducerReport};
 use crate::digits::DigitSource;
-use crate::performance::RuntimeMetrics;
+use crate::performance::{PerformanceSnapshot, RuntimeMetrics};
 use crate::search::backend::{SearchBackend, create_search_backend};
 use crate::search::rate::RateTracker;
 use crate::search::types::{
     FinishReason, GenerationProgress, MatchMode, SearchOptions, SearchReporter, SearchSnapshot,
 };
-use crate::storage::{BestEventRecord, RunRecord, RunStatus, Storage};
+use crate::storage::{BestEventRecord, CheckpointProgress, RunRecord, RunStatus, Storage};
+
+mod pipeline;
+pub(crate) mod resource_budget;
+mod source_reader;
+mod telemetry;
+
+pub(crate) use resource_budget::{ReaderCapacityLease, ResourceBudget};
+pub(crate) use source_reader::DigitReaderPool;
+pub(crate) use telemetry::SessionTelemetry;
+
+pub(crate) use pipeline::run as run_pipeline;
 
 /// Live engine facts that are reported but not configured.
 #[derive(Clone, Debug)]
@@ -29,13 +42,22 @@ pub(crate) struct RuntimeContext {
     pub window_len: usize,
     pub active_backend: String,
     pub gpu_status: String,
+    pub producer_epochs: u64,
+    pub coalesced_request_count: u64,
+    pub generation_batches: u64,
+    pub reducer_contiguous_completed_offsets: u64,
+    pub reducer_max_reorder_depth: u64,
 }
 
 pub(crate) struct SearchSession<'a> {
     pub run: RunRecord,
     pub options: SearchOptions,
     pub backend: Box<dyn SearchBackend>,
+    pub(crate) budget: Arc<ResourceBudget>,
     pub runtime: RuntimeContext,
+    pub telemetry: SessionTelemetry,
+    pub reader_pool: Option<DigitReaderPool<'a>>,
+    _reader_capacity: ReaderCapacityLease,
     pub recent_events: Vec<BestEventRecord>,
     pub source: &'a dyn DigitSource,
     pub source_len: u64,
@@ -57,11 +79,12 @@ pub(crate) struct SearchSession<'a> {
 }
 
 impl<'a> SearchSession<'a> {
-    pub fn new(
+    pub fn new_with_budget(
         storage: &Storage,
         run: RunRecord,
         source: &'a dyn DigitSource,
         mut options: SearchOptions,
+        shared_budget: Option<Arc<ResourceBudget>>,
     ) -> Result<Self> {
         if options.threshold > 9 {
             bail!("threshold must be between 0 and 9");
@@ -78,7 +101,6 @@ impl<'a> SearchSession<'a> {
         options.checkpoint_every =
             Duration::from_secs(options.performance.limits.checkpoint_every_secs);
 
-        let source_len = source.len()?;
         let (canvas_width, canvas_height) = canvas_size(&run, &options);
         if options.match_mode.is_emergence()
             && (canvas_width < run.target_bitmap.width || canvas_height < run.target_bitmap.height)
@@ -100,8 +122,42 @@ impl<'a> SearchSession<'a> {
             bail!("target bitmap is empty");
         }
 
-        let backend = create_search_backend(&options, &run.target_bitmap)?;
+        let budget = match shared_budget {
+            Some(budget) => budget,
+            None => ResourceBudget::new(
+                options.performance.limits.queue_depth,
+                options.performance.limits.memory_limit_mb,
+                options.performance.limits.cpu_workers,
+            )?,
+        };
+        budget.validate_minimum(window_len)?;
+        let source_len = source.len()?;
+
         let recent_events = storage.history(&run.id, Some(8)).unwrap_or_default();
+        let runtime_base = run.total_runtime_secs;
+        let invocation_start_offset = run.current_offset;
+        let invocation_start_scanned = run.scanned_windows;
+        let telemetry_enabled = options.performance.show_metrics;
+        let max_read_len = options
+            .chunk_windows
+            .checked_add(window_len - 1)
+            .ok_or_else(|| anyhow::anyhow!("digit reader buffer size overflowed"))?;
+        let reader_capacity = DigitReaderPool::configured_capacity_bytes(
+            source,
+            options.performance.limits.cpu_workers,
+            options.performance.limits.queue_depth,
+            max_read_len,
+        )?;
+        let reader_capacity = budget.reserve_reader_capacity(reader_capacity)?;
+        let backend = create_search_backend(&options, &run.target_bitmap, budget.as_ref())?;
+        let reader_pool = DigitReaderPool::new(
+            source,
+            options.performance.limits.cpu_workers,
+            options.performance.limits.queue_depth,
+            max_read_len,
+        )?;
+        let mut telemetry = SessionTelemetry::new(telemetry_enabled);
+        telemetry.record_source_pool(reader_pool.telemetry());
         let runtime = RuntimeContext {
             last_chunk_processing: Duration::ZERO,
             checkpoint_count: 0,
@@ -110,16 +166,22 @@ impl<'a> SearchSession<'a> {
             window_len,
             active_backend: backend.name().to_string(),
             gpu_status: backend.gpu_status(),
+            producer_epochs: 0,
+            coalesced_request_count: 0,
+            generation_batches: 0,
+            reducer_contiguous_completed_offsets: 0,
+            reducer_max_reorder_depth: 0,
         };
-        let runtime_base = run.total_runtime_secs;
-        let invocation_start_offset = run.current_offset;
-        let invocation_start_scanned = run.scanned_windows;
 
         let mut session = Self {
             run,
             options,
             backend,
+            budget,
             runtime,
+            telemetry,
+            reader_pool: Some(reader_pool),
+            _reader_capacity: reader_capacity,
             recent_events,
             source,
             source_len,
@@ -150,15 +212,6 @@ impl<'a> SearchSession<'a> {
             self.runtime_base + self.session_start.elapsed().as_secs_f64();
     }
 
-    pub fn refresh_source_len(&mut self) -> Result<()> {
-        if self.source.is_growing() {
-            self.source_len = self.source.len()?;
-            self.run.generated_digit_count = self.source_len;
-            self.generation_rate.record(Instant::now(), self.source_len);
-        }
-        Ok(())
-    }
-
     /// Called wherever scan progress advances, which is what the rolling meter
     /// samples. Cheap enough to call on every chunk.
     pub fn record_progress(&mut self) {
@@ -173,7 +226,8 @@ impl<'a> SearchSession<'a> {
 
     /// Rebuilds the backend after a change that could flip the CPU/GPU decision.
     pub fn rebuild_backend(&mut self) -> Result<()> {
-        let backend = create_search_backend(&self.options, &self.run.target_bitmap)?;
+        let backend =
+            create_search_backend(&self.options, &self.run.target_bitmap, self.budget.as_ref())?;
         self.backend = backend;
         self.sync_backend_labels();
         Ok(())
@@ -181,7 +235,41 @@ impl<'a> SearchSession<'a> {
 
     pub fn checkpoint(&mut self, storage: &mut Storage) -> Result<()> {
         self.touch_runtime();
-        storage.update_run(&mut self.run)?;
+        let prior = self.run.checkpoint_state();
+        let progress = CheckpointProgress {
+            current_offset: self.run.current_offset,
+            scanned_windows: self.run.scanned_windows,
+            best_score: self.run.best_score,
+            best_offset: self.run.best_offset,
+            stop_reason: prior.progress.stop_reason,
+            checkpoint_sequence: prior.progress.checkpoint_sequence,
+        };
+        let params = serde_json::from_str::<serde_json::Value>(&self.run.params_json)?;
+        let mut performance_snapshot = match params.get("performance_snapshot") {
+            Some(value) => PerformanceSnapshot::decode_value(value.clone())?,
+            None => PerformanceSnapshot::from_settings(
+                self.options.performance.clone(),
+                Some(self.run.current_offset),
+                self.options.work_windows,
+                self.options.limit,
+            ),
+        };
+        performance_snapshot.settings = self.options.performance.clone();
+        performance_snapshot.current_offset = Some(self.run.current_offset);
+        performance_snapshot.work_windows = self.options.work_windows;
+        performance_snapshot.limit = self.options.limit;
+        performance_snapshot.max_offset = self.options.max_offset;
+        performance_snapshot.keep_going_after_perfect = self.options.keep_going_after_perfect;
+        let started = Instant::now();
+        let checkpoint = storage
+            .checkpoint_with_snapshot(&self.run.id, &progress, &performance_snapshot)
+            .map_err(|failure| failure.cause)?;
+        self.run.current_offset = checkpoint.progress.current_offset;
+        self.run.scanned_windows = checkpoint.progress.scanned_windows;
+        self.run.best_score = checkpoint.progress.best_score;
+        self.run.best_offset = checkpoint.progress.best_offset;
+        self.run.params_json = checkpoint.params_json;
+        self.telemetry.record_persistence(started.elapsed());
         self.runtime.checkpoint_count += 1;
         self.last_checkpoint = Instant::now();
         Ok(())
@@ -222,7 +310,9 @@ impl<'a> SearchSession<'a> {
             | FinishReason::MaxOffsetReached => RunStatus::Paused,
         };
         self.touch_runtime();
+        let started = Instant::now();
         storage.update_run(&mut self.run)?;
+        self.telemetry.record_persistence(started.elapsed());
         reporter.on_finish(&self.snapshot(), reason)
     }
 
@@ -242,20 +332,24 @@ impl<'a> SearchSession<'a> {
         let rolling = self.scan_rate.rate();
         let speed = if rolling > 0.0 { rolling } else { average };
         let source_is_growing = self.source.is_growing();
+        let source_len = if source_is_growing {
+            self.source.len().unwrap_or(self.source_len)
+        } else {
+            self.source_len
+        };
         let window_len = self.window_len as u64;
         // "Waiting" means running but starved: the generator has not produced
         // enough digits for the next window yet.
         let waiting_for_digits = source_is_growing
-            && (self.source_len < window_len
-                || self.run.current_offset + window_len > self.source_len);
+            && (source_len < window_len || self.run.current_offset + window_len > source_len);
 
         let mut metrics = RuntimeMetrics::from_settings(
             &self.options.performance,
             self.runtime.last_chunk_processing,
             self.runtime.checkpoint_count,
-            self.source_len,
+            source_len,
             self.run.current_offset,
-            self.source_len.saturating_sub(self.run.current_offset),
+            source_len.saturating_sub(self.run.current_offset),
             self.runtime.window_len,
             self.runtime.throttling_active,
             self.runtime.battery_throttle_active,
@@ -263,10 +357,106 @@ impl<'a> SearchSession<'a> {
         metrics.search_backend = self.runtime.active_backend.clone();
         metrics.gpu_status = self.runtime.gpu_status.clone();
 
+        let resolved_backend = self
+            .telemetry
+            .resolved_backend(&self.runtime.active_backend);
+        metrics.backend_device = self
+            .runtime
+            .gpu_status
+            .strip_prefix("active: ")
+            .map_or_else(
+                || {
+                    if resolved_backend == "cpu" {
+                        "cpu".to_string()
+                    } else {
+                        "wgpu".to_string()
+                    }
+                },
+                str::to_string,
+            );
+        metrics.backend_feature_available =
+            matches!(resolved_backend.as_str(), "cpu" | "wgpu" | "cuda" | "mixed");
+        metrics.backend_fault_status = if self.telemetry.fallback_count() > 0 {
+            "runtime_fault".to_string()
+        } else {
+            "none".to_string()
+        };
+        metrics.fallback = self.telemetry.fallback_count() > 0;
+        metrics.fallback_reason = self.telemetry.fallback_reason();
+        metrics.fallback_count = self.telemetry.fallback_count();
+        metrics.gpu_submissions = self.telemetry.gpu_submissions();
+        metrics.gpu_completions = self.telemetry.gpu_completions();
+        metrics.gpu_buffer_creations = self.telemetry.gpu_buffer_creations();
+        metrics.gpu_bind_group_creations = self.telemetry.gpu_bind_group_creations();
+        metrics.gpu_resource_reuses = self.telemetry.gpu_resource_reuses();
+        let overlap = self.telemetry.gpu_overlap();
+        metrics.gpu_overlap_ms = if overlap.is_zero() {
+            0
+        } else {
+            u64::try_from(overlap.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        };
+        metrics.gpu_max_in_flight = self.telemetry.gpu_max_in_flight();
+        metrics.gpu_overlap_events = self.telemetry.gpu_overlap_events();
+        metrics.gpu_test_only_mock = self.telemetry.gpu_test_only_mock();
+        let gpu_duty = self.telemetry.gpu_duty();
+        metrics.gpu_duty_wait_ms = duration_ms(gpu_duty.wait);
+        metrics.gpu_initial_submission_wait_ms = duration_ms(gpu_duty.initial_submission_wait);
+        metrics.active_submission_ratio = gpu_duty.active_submission_ratio;
+        metrics.dispatch_quantum_ratio = gpu_duty.dispatch_quantum_ratio;
+        metrics.stage_timings = self.telemetry.stages();
+        metrics.waits = self.telemetry.waits();
+        metrics.source = self.telemetry.source_report();
+        let budget = self.budget.snapshot();
+        metrics.queue = QueueReport {
+            current_occupancy: budget.queue_current,
+            max_occupancy: budget.queue_peak,
+            permits: budget.queue_limit,
+            global_limit: budget.queue_limit,
+        };
+        metrics.memory = MemoryReport {
+            logical_reserved_mb: bytes_to_mb(budget.memory_reserved_bytes),
+            logical_peak_mb: bytes_to_mb(budget.memory_peak_bytes),
+            logical_budget_mb: bytes_to_mb(budget.memory_limit_bytes),
+            logical_reserved_bytes: budget.memory_reserved_bytes,
+            logical_peak_bytes: budget.memory_peak_bytes,
+            logical_budget_bytes: budget.memory_limit_bytes,
+            rss_peak_mb: budget.rss_peak_mb,
+            rss_baseline_mb: budget.rss_baseline_mb,
+            rss_margin_mb: budget.rss_margin_mb,
+            gpu_vram_status: "unavailable".to_string(),
+            ..MemoryReport::default()
+        };
+        metrics.reducer = ReducerReport {
+            ordered: true,
+            contiguous_completed_offsets: self.runtime.reducer_contiguous_completed_offsets,
+            max_reorder_depth: self.runtime.reducer_max_reorder_depth,
+        };
+        metrics.cpu_permits_in_use = budget.cpu_permits_in_use;
+        metrics.cpu_permits_peak = budget.cpu_permits_peak;
+        metrics.cpu_permits_max = budget.cpu_permits_max;
+        metrics.resolved_backend = resolved_backend;
+        let generation_rate = self
+            .source
+            .generation_metrics()
+            .map(|generation| {
+                let elapsed = generation.generator_wait.as_secs_f64();
+                if elapsed > 0.0 {
+                    generation.generated_source_digits as f64 / elapsed
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0)
+            .max(self.generation_rate.rate());
+        metrics.generator_digits_per_second = generation_rate;
+        metrics.telemetry_enabled = self.telemetry.enabled();
+
         let generation = self.source.generation().map(|state| GenerationProgress {
             active: state.active,
             target_digits: state.target_digits,
-            digits_per_sec: self.generation_rate.rate(),
+            digits_per_sec: generation_rate,
         });
 
         SearchSnapshot {
@@ -277,10 +467,10 @@ impl<'a> SearchSession<'a> {
             progress: self.progress(scanned_this_invocation),
             recent_events: self.recent_events.clone(),
             source_kind: self.source.kind().to_string(),
-            source_len: self.source_len,
+            source_len,
             source_is_growing,
             waiting_for_digits,
-            cache_gap_digits: self.source_len.saturating_sub(self.run.current_offset),
+            cache_gap_digits: source_len.saturating_sub(self.run.current_offset),
             generation,
             metrics,
         }
@@ -315,6 +505,14 @@ impl<'a> SearchSession<'a> {
             .scanned_windows
             .saturating_sub(self.invocation_start_scanned)
     }
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / 1_048_576.0
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Emergence searches read a canvas larger than the target so the shape has room

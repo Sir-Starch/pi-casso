@@ -1,17 +1,27 @@
 //! The background search thread and the channel that carries its progress back
 //! to the UI.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
+use crate::benchmark_contract::BackendResolution;
+use crate::performance::PerformanceSnapshot;
 use crate::search::{
     FinishReason, SearchCommand, SearchOptions, SearchReporter, SearchSnapshot,
     run_search_controlled,
 };
 use crate::storage::{BestEventRecord, RunRecord, RunStatus, Storage};
+use crate::tui::PreparedResume;
+use crate::tui::tabs::hunt::PreparedStart;
+
+#[cfg(test)]
+static TEST_WORKER_START_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub enum WorkerEvent {
     Snapshot(Box<SearchSnapshot>),
@@ -20,10 +30,70 @@ pub enum WorkerEvent {
     Error(String),
 }
 
+#[derive(Clone, Debug)]
+struct PreparedWorkerHandoff {
+    snapshot: PerformanceSnapshot,
+    capability: BackendResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerHandoffMarker {
+    pub snapshot_sha256: String,
+    pub capability_sha256: String,
+    pub capability_status: &'static str,
+    pub capability_requested: &'static str,
+    pub capability_resolved: Option<&'static str>,
+}
+
+impl PreparedWorkerHandoff {
+    fn marker(&self) -> WorkerHandoffMarker {
+        let snapshot_json = self.snapshot.encode_value().to_string();
+        let capability_json = serde_json::json!({
+            "status": self.capability.status,
+            "requested": self.capability.requested,
+            "resolved": self.capability.resolved,
+            "gpu_mode": self.capability.gpu_mode,
+            "fallback": self.capability.fallback,
+            "reason": self.capability.reason,
+            "auto_min_work_windows": self.capability.auto_min_work_windows,
+            "backend_candidates": self
+                .capability
+                .backend_candidates
+                .iter()
+                .map(|candidate| {
+                    serde_json::json!({
+                        "backend": candidate.backend,
+                        "status": candidate.status,
+                        "eligible": candidate.eligible,
+                        "reason": candidate.reason,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        WorkerHandoffMarker {
+            snapshot_sha256: format!("{:x}", Sha256::digest(snapshot_json.as_bytes())),
+            capability_sha256: format!(
+                "{:x}",
+                Sha256::digest(capability_json.to_string().as_bytes())
+            ),
+            capability_status: self.capability.status,
+            capability_requested: self.capability.requested,
+            capability_resolved: self.capability.resolved,
+        }
+    }
+}
+
+impl WorkerHandoffMarker {
+    pub fn telemetry_marker(&self) -> String {
+        "worker_handoff_received=true".to_string()
+    }
+}
+
 pub struct SearchWorker {
     control: Sender<SearchCommand>,
     events: Receiver<WorkerEvent>,
     handle: Option<JoinHandle<()>>,
+    prepared_handoff: Option<PreparedWorkerHandoff>,
     pub latest: Option<SearchSnapshot>,
     pub paused: bool,
     pub finished: Option<FinishReason>,
@@ -34,7 +104,44 @@ pub struct SearchWorker {
 }
 
 impl SearchWorker {
+    pub fn start_prepared_start(prepared: PreparedStart) -> Self {
+        let PreparedStart {
+            run,
+            options,
+            capability,
+        } = prepared;
+        let _validated_backend = capability.resolved;
+        Self::start(run, options)
+    }
+
+    pub fn start_prepared(prepared: PreparedResume) -> Self {
+        let PreparedResume {
+            run,
+            snapshot,
+            options,
+            capability,
+        } = prepared;
+        Self::start_with_handoff(
+            run,
+            options,
+            Some(PreparedWorkerHandoff {
+                snapshot,
+                capability,
+            }),
+        )
+    }
+
     pub fn start(run: RunRecord, options: SearchOptions) -> Self {
+        Self::start_with_handoff(run, options, None)
+    }
+
+    fn start_with_handoff(
+        run: RunRecord,
+        options: SearchOptions,
+        prepared_handoff: Option<PreparedWorkerHandoff>,
+    ) -> Self {
+        #[cfg(test)]
+        TEST_WORKER_START_COUNT.fetch_add(1, Ordering::SeqCst);
         let (control, control_rx) = mpsc::channel();
         let (events_tx, events) = mpsc::channel();
         let handle = thread::spawn(move || {
@@ -63,12 +170,19 @@ impl SearchWorker {
             control,
             events,
             handle: Some(handle),
+            prepared_handoff,
             latest: None,
             paused: false,
             finished: None,
             error: None,
             quit_after_stop: false,
         }
+    }
+
+    pub fn prepared_handoff_marker(&self) -> Option<WorkerHandoffMarker> {
+        self.prepared_handoff
+            .as_ref()
+            .map(PreparedWorkerHandoff::marker)
     }
 
     /// Best-effort: a worker that has already exited simply ignores commands.
@@ -96,6 +210,16 @@ impl SearchWorker {
             let _ = handle.join();
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_reset_worker_start_count() {
+    TEST_WORKER_START_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_worker_start_count() -> usize {
+    TEST_WORKER_START_COUNT.load(Ordering::SeqCst)
 }
 
 /// Throttles snapshots to the refresh rate the active profile asks for; a fast

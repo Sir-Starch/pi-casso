@@ -2,6 +2,8 @@
 //! dashboard when something is.
 
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -12,8 +14,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Gauge, Paragraph, Wrap};
 
 use crate::art::{self, ArtMapping, Bitmap};
+use crate::benchmark_contract::{
+    AUTO_MIN_WORK_WINDOWS, BackendPreflightRequest, BackendResolution, CudaPreflight,
+    WgpuPreflight, cuda_preflight, resolve_backend_preflight,
+};
+use crate::capability::GpuCapability;
 use crate::config::Config;
-use crate::digits::{DigitSource, DigitSourceSpec, FileDigitSource};
+use crate::digits::DigitSourceSpec;
 use crate::performance::{
     GeneratorBackendChoice, GpuMode, PerformanceOverrides, PerformanceProfile, PerformanceSettings,
     SearchBackendChoice, ThermalMode,
@@ -23,7 +30,7 @@ use crate::render::{
     BitmapView, PipelineState, Theme, bitmap_lines_fit, fmt_count, fmt_duration, fmt_percent,
     fmt_rate, opt_u64, snapshot_state, truncate,
 };
-use crate::search::{MatchMode, SearchOptions, SearchSnapshot};
+use crate::search::{BackendSelectionError, MatchMode, SearchOptions, SearchSnapshot};
 use crate::storage::{NewRun, RunRecord, RunStatus, Storage};
 use crate::tui::form::{Field, Form, FormOutcome};
 use crate::tui::live::{best_lines, history_lines};
@@ -88,6 +95,49 @@ pub struct HuntTab {
     /// Set when focus moved, so the next draw can re-anchor the scroll window.
     dirty_focus: bool,
 }
+
+pub struct StartSpec {
+    target: StartTarget,
+    name: Option<String>,
+    source: StartDigitSource,
+    template_name: Option<String>,
+    width: usize,
+    height: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+    match_mode: MatchMode,
+    threshold: u8,
+    invert: bool,
+    params_json: String,
+    options: SearchOptions,
+}
+
+pub struct PreparedStart {
+    pub run: RunRecord,
+    pub options: SearchOptions,
+    pub capability: BackendResolution,
+}
+
+enum StartTarget {
+    Template(String),
+    File(PathBuf),
+}
+
+enum StartDigitSource {
+    Cache(PathBuf),
+    File {
+        path: PathBuf,
+        allow_decimal_prefix: bool,
+    },
+    Demo,
+}
+
+#[cfg(test)]
+static TEST_FORCE_START_WGPU_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_FAIL_IF_SOURCE_OPEN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_SOURCE_OPEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 impl HuntTab {
     pub fn new(config: &Config) -> Self {
@@ -333,8 +383,7 @@ impl HuntTab {
         outcome
     }
 
-    /// Turns the form into a run and the options to search it with.
-    pub fn build(&self) -> Result<(RunRecord, SearchOptions)> {
+    pub fn start_spec(&self) -> Result<StartSpec> {
         let width = parse_positive(self.form.text(WizardField::Width), "width")?;
         let height = parse_positive(self.form.text(WizardField::Height), "height")?;
         let match_mode = match self.form.choice(WizardField::MatchMode) {
@@ -363,20 +412,6 @@ impl HuntTab {
             (width, height)
         };
 
-        let target = self.load_target(width, height)?;
-        let (source, generated_digit_count) = self.build_source()?;
-        // Fail before creating the run rather than leaving an unusable row behind.
-        let source_impl = source.open()?;
-        source_impl.len()?;
-
-        let name = if self.form.text(WizardField::Name).trim().is_empty() {
-            format!("pi-casso-{}", Utc::now().timestamp())
-        } else {
-            self.form.text(WizardField::Name).trim().to_string()
-        };
-        let template_name = (self.form.choice(WizardField::ArtSource) == 0)
-            .then(|| art::template_names()[self.form.choice(WizardField::Template)].to_string());
-
         let profile = PROFILES[self.form.choice(WizardField::Profile)];
         let gpu = GPU_MODES[self.form.choice(WizardField::Gpu)];
         let thermal = THERMAL_MODES[self.form.choice(WizardField::Thermal)];
@@ -404,27 +439,9 @@ impl HuntTab {
             "keep_going_after_perfect": keep_going,
         });
 
-        let mut storage = Storage::open_default()?;
-        let run = storage.create_run(NewRun {
-            name,
-            source,
-            template_name,
-            art_hash: target.sha256(),
-            width: target.width as u32,
-            height: target.height as u32,
-            canvas_width: canvas_width as u32,
-            canvas_height: canvas_height as u32,
-            match_mode,
-            threshold,
-            invert_enabled: invert,
-            start_offset: Some(0),
-            target_bitmap: target,
-            generated_digit_count,
-            params_json: params.to_string(),
-        })?;
-
         let options = SearchOptions {
             max_offset: None,
+            work_windows: None,
             limit,
             match_mode,
             canvas_width,
@@ -438,7 +455,105 @@ impl HuntTab {
             chunk_windows: performance.limits.chunk_size,
             performance,
         };
-        Ok((run, options))
+        let target = if self.form.choice(WizardField::ArtSource) == 0 {
+            StartTarget::Template(
+                art::template_names()[self.form.choice(WizardField::Template)].to_string(),
+            )
+        } else {
+            let path = self.form.text(WizardField::ArtFile).trim();
+            if path.is_empty() {
+                return Err(anyhow!("enter a path to an ASCII-art file"));
+            }
+            StartTarget::File(PathBuf::from(path))
+        };
+        let name = (!self.form.text(WizardField::Name).trim().is_empty())
+            .then(|| self.form.text(WizardField::Name).trim().to_string());
+        let template_name = match &target {
+            StartTarget::Template(name) => Some(name.clone()),
+            StartTarget::File(_) => None,
+        };
+
+        Ok(StartSpec {
+            target,
+            name,
+            source: self.build_source_spec()?,
+            template_name,
+            width,
+            height,
+            canvas_width,
+            canvas_height,
+            match_mode,
+            threshold,
+            invert,
+            params_json: params.to_string(),
+            options,
+        })
+    }
+
+    pub fn build(
+        &self,
+        mut start: StartSpec,
+        capability: BackendResolution,
+    ) -> Result<PreparedStart> {
+        apply_resolved_backend(&mut start.options, &capability)?;
+        let target = match &start.target {
+            StartTarget::Template(template) => {
+                art::load_template(template, start.width, start.height)?
+            }
+            StartTarget::File(path) => {
+                let contents = std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                Bitmap::from_ascii(&contents, start.width, start.height, &ArtMapping::default())?
+            }
+        };
+        let (source, generated_digit_count) = materialize_source(start.source)?;
+        let mut storage = Storage::open_default()?;
+        let run = storage.create_run(NewRun {
+            name: start
+                .name
+                .unwrap_or_else(|| format!("pi-casso-{}", Utc::now().timestamp())),
+            source,
+            template_name: start.template_name,
+            art_hash: target.sha256(),
+            width: target.width as u32,
+            height: target.height as u32,
+            canvas_width: start.canvas_width as u32,
+            canvas_height: start.canvas_height as u32,
+            match_mode: start.match_mode,
+            threshold: start.threshold,
+            invert_enabled: start.invert,
+            start_offset: Some(0),
+            target_bitmap: target,
+            generated_digit_count,
+            params_json: start.params_json,
+        })?;
+        Ok(PreparedStart {
+            run,
+            options: start.options,
+            capability,
+        })
+    }
+
+    fn build_source_spec(&self) -> Result<StartDigitSource> {
+        match self.form.choice(WizardField::PiSource) {
+            0 => {
+                let cache = pi::PiCache::default()?;
+                Ok(StartDigitSource::Cache(cache.path().clone()))
+            }
+            1 => {
+                let raw = self.form.text(WizardField::PiFile).trim();
+                if raw.is_empty() {
+                    return Err(anyhow!(
+                        "enter a pi digit file, or switch to infinite generated pi"
+                    ));
+                }
+                Ok(StartDigitSource::File {
+                    path: PathBuf::from(raw),
+                    allow_decimal_prefix: self.form.toggled(WizardField::AllowDecimalPrefix),
+                })
+            }
+            _ => Ok(StartDigitSource::Demo),
+        }
     }
 
     fn load_target(&self, width: usize, height: usize) -> Result<Bitmap> {
@@ -453,34 +568,6 @@ impl HuntTab {
         let contents =
             std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
         Bitmap::from_ascii(&contents, width, height, &ArtMapping::default())
-    }
-
-    fn build_source(&self) -> Result<(DigitSourceSpec, u64)> {
-        match self.form.choice(WizardField::PiSource) {
-            0 => {
-                let cache = pi::PiCache::default()?;
-                cache.ensure_parent()?;
-                Ok((
-                    DigitSourceSpec::cache(cache.path().clone()),
-                    cache.digit_count()?,
-                ))
-            }
-            1 => {
-                let raw = self.form.text(WizardField::PiFile).trim();
-                if raw.is_empty() {
-                    return Err(anyhow!(
-                        "enter a pi digit file, or switch to infinite generated pi"
-                    ));
-                }
-                let allow_prefix = self.form.toggled(WizardField::AllowDecimalPrefix);
-                let path = PathBuf::from(raw)
-                    .canonicalize()
-                    .with_context(|| format!("could not resolve {raw}"))?;
-                FileDigitSource::new_with_options(path.clone(), allow_prefix).validate()?;
-                Ok((DigitSourceSpec::file(path, allow_prefix), 0))
-            }
-            _ => Ok((DigitSourceSpec::demo(), 0)),
-        }
     }
 
     /// Live preview of whatever the art fields currently describe.
@@ -600,6 +687,175 @@ pub fn draw_dashboard(
             rows[4],
         );
     }
+}
+
+impl StartSpec {
+    pub fn resolve_preflight(
+        &self,
+    ) -> std::result::Result<BackendResolution, BackendSelectionError> {
+        let effective_work_windows =
+            SearchOptions::intersect_count_bounds(self.options.work_windows, self.options.limit)
+                .unwrap_or_default();
+        let (backend, gpu) = match self.options.performance.gpu {
+            GpuMode::Off => (SearchBackendChoice::Cpu, GpuMode::Off),
+            GpuMode::Auto => (SearchBackendChoice::Auto, GpuMode::Auto),
+            GpuMode::On => (SearchBackendChoice::Gpu, GpuMode::On),
+        };
+        let cuda_capability = (gpu == GpuMode::Auto
+            && effective_work_windows >= AUTO_MIN_WORK_WINDOWS)
+            .then(start_cuda_capability);
+        let cuda = cuda_capability
+            .as_ref()
+            .map_or(CudaPreflight::NotProbed, cuda_preflight);
+        let probes_wgpu = !matches!(cuda, CudaPreflight::Eligible)
+            && (gpu == GpuMode::On
+                || (gpu == GpuMode::Auto && effective_work_windows >= AUTO_MIN_WORK_WINDOWS));
+        let wgpu = if probes_wgpu {
+            let capability = start_wgpu_capability(
+                self.options
+                    .performance
+                    .gpu_device
+                    .as_deref()
+                    .filter(|device| *device != "auto"),
+            );
+            if capability.capability_state == "preflight_ok" {
+                WgpuPreflight::Eligible
+            } else {
+                WgpuPreflight::Unavailable(match capability.reason.as_str() {
+                    "adapter_unavailable" => "adapter_unavailable",
+                    _ => "pipeline_preflight_unavailable",
+                })
+            }
+        } else {
+            WgpuPreflight::NotProbed
+        };
+        let resolution = resolve_backend_preflight(BackendPreflightRequest {
+            backend: Some(backend),
+            gpu: Some(gpu),
+            effective_work_windows,
+            cuda,
+            wgpu,
+        });
+        match resolution.status {
+            "ok" => Ok(resolution),
+            "unsupported" | "selection_error" => Err(BackendSelectionError {
+                status: resolution.status,
+                reason: resolution.reason,
+                requested_backend: resolution.requested.to_string(),
+            }),
+            status => Err(BackendSelectionError {
+                status,
+                reason: resolution.reason,
+                requested_backend: resolution.requested.to_string(),
+            }),
+        }
+    }
+}
+
+fn start_cuda_capability() -> GpuCapability {
+    #[cfg(feature = "cuda-native")]
+    {
+        crate::cuda::detect_capability()
+    }
+    #[cfg(not(feature = "cuda-native"))]
+    {
+        GpuCapability::cuda_unavailable("cuda_not_compiled", "not_attempted")
+    }
+}
+
+fn start_wgpu_capability(device_filter: Option<&str>) -> GpuCapability {
+    #[cfg(test)]
+    if test_start_wgpu_unavailable() {
+        return GpuCapability::unavailable("adapter_unavailable");
+    }
+    GpuCapability::detect_with_filter(device_filter)
+}
+
+fn apply_resolved_backend(
+    options: &mut SearchOptions,
+    capability: &BackendResolution,
+) -> Result<()> {
+    match capability.resolved {
+        Some("cpu") => {
+            options.performance.backend = SearchBackendChoice::Cpu;
+            options.performance.gpu = GpuMode::Off;
+        }
+        Some("wgpu") => {
+            options.performance.backend = SearchBackendChoice::Gpu;
+            options.performance.gpu = GpuMode::On;
+        }
+        Some("cuda") => {
+            options.performance.backend = SearchBackendChoice::Cuda;
+            options.performance.gpu = GpuMode::On;
+        }
+        Some(backend) => return Err(anyhow!("unknown resolved backend {backend}")),
+        None => return Err(anyhow!("backend preflight did not select a backend")),
+    }
+    Ok(())
+}
+
+fn materialize_source(source: StartDigitSource) -> Result<(DigitSourceSpec, u64)> {
+    #[cfg(test)]
+    test_source_open_boundary()?;
+    let (source, generated_digit_count) = match source {
+        StartDigitSource::Cache(path) => {
+            let cache = pi::PiCache::new(path.clone());
+            cache.ensure_parent()?;
+            let generated_digit_count = cache.published_digit_count()?;
+            (DigitSourceSpec::cache(path), generated_digit_count)
+        }
+        StartDigitSource::File {
+            path,
+            allow_decimal_prefix,
+        } => {
+            let path = path
+                .canonicalize()
+                .with_context(|| format!("could not resolve {}", path.display()))?;
+            (DigitSourceSpec::file(path, allow_decimal_prefix), 0)
+        }
+        StartDigitSource::Demo => (DigitSourceSpec::demo(), 0),
+    };
+    Ok((source, generated_digit_count))
+}
+
+#[cfg(test)]
+fn test_start_wgpu_unavailable() -> bool {
+    TEST_FORCE_START_WGPU_UNAVAILABLE.load(Ordering::SeqCst)
+        || (crate::gpu_ring::test_mode_enabled()
+            && std::env::var("PI_CASSO_TEST_FORCE_CAPABILITY")
+                .is_ok_and(|value| value == "wgpu-unavailable"))
+}
+
+#[cfg(test)]
+fn test_source_open_boundary() -> Result<()> {
+    TEST_SOURCE_OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+    let fails = TEST_FAIL_IF_SOURCE_OPEN.load(Ordering::SeqCst)
+        || (crate::gpu_ring::test_mode_enabled()
+            && std::env::var("PI_CASSO_TEST_FAIL_IF_SOURCE_OPEN").is_ok_and(|value| value == "1"));
+    if fails {
+        return Err(anyhow!(
+            "PI_CASSO_TEST_FAIL_IF_SOURCE_OPEN reached the TUI source-open boundary"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn test_force_start_wgpu_unavailable(enabled: bool) {
+    TEST_FORCE_START_WGPU_UNAVAILABLE.store(enabled, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_fail_if_source_open(enabled: bool) {
+    TEST_FAIL_IF_SOURCE_OPEN.store(enabled, Ordering::SeqCst);
+    if enabled {
+        TEST_SOURCE_OPEN_COUNT.store(0, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_source_open_count() -> usize {
+    TEST_SOURCE_OPEN_COUNT.load(Ordering::SeqCst)
 }
 
 /// One line naming the run and its shape, so the dashboard says *what* is being
@@ -832,6 +1088,7 @@ pub fn status_label(snapshot: Option<&SearchSnapshot>) -> (String, PipelineState
 ///
 /// The profile is read back from the run's own parameters instead of being
 /// hard-coded, so resuming an eco hunt does not silently promote it.
+#[cfg(test)]
 pub fn resume_options(run: &RunRecord) -> SearchOptions {
     let params: serde_json::Value =
         serde_json::from_str(&run.params_json).unwrap_or(serde_json::Value::Null);
@@ -862,6 +1119,7 @@ pub fn resume_options(run: &RunRecord) -> SearchOptions {
     let performance = performance_settings(profile, gpu, thermal, workers, run.match_mode);
     SearchOptions {
         max_offset: None,
+        work_windows: None,
         limit: None,
         match_mode: run.match_mode,
         canvas_width: run.canvas_width as usize,
@@ -918,6 +1176,7 @@ fn profile_index(profile: PerformanceProfile) -> usize {
         .unwrap_or(1)
 }
 
+#[cfg(test)]
 fn profile_from_str(value: &str) -> Option<PerformanceProfile> {
     PROFILES
         .iter()
@@ -925,6 +1184,7 @@ fn profile_from_str(value: &str) -> Option<PerformanceProfile> {
         .find(|profile| profile.as_str() == value)
 }
 
+#[cfg(test)]
 fn gpu_from_str(value: &str) -> Option<GpuMode> {
     GPU_MODES
         .iter()
@@ -936,6 +1196,7 @@ fn gpu_label(mode: GpuMode) -> &'static str {
     mode.as_str()
 }
 
+#[cfg(test)]
 fn thermal_from_str(value: &str) -> Option<ThermalMode> {
     THERMAL_MODES
         .iter()
@@ -1101,7 +1362,7 @@ mod tests {
             .set_choice(WizardField::SizeMode, CUSTOM_SIZE_INDEX);
         tab.sync_enabled();
         tab.form.set_text(WizardField::Width, "");
-        let error = tab.build().unwrap_err().to_string();
+        let error = tab.start_spec().err().unwrap().to_string();
         assert!(error.contains("width"), "unexpected error: {error}");
     }
 
@@ -1113,7 +1374,7 @@ mod tests {
         tab.sync_enabled();
         tab.form.set_text(WizardField::CanvasWidth, "8");
         tab.form.set_text(WizardField::CanvasHeight, "8");
-        let error = tab.build().unwrap_err().to_string();
+        let error = tab.start_spec().err().unwrap().to_string();
         assert!(error.contains("canvas"), "unexpected error: {error}");
     }
 
@@ -1122,7 +1383,7 @@ mod tests {
         let mut tab = HuntTab::new(&Config::default());
         tab.form.set_choice(WizardField::ArtSource, 1);
         tab.sync_enabled();
-        assert!(tab.build().is_err());
+        assert!(tab.start_spec().is_err());
     }
 
     #[test]

@@ -7,16 +7,20 @@
 //! - [`engine`] — the loop that drives all of the above
 
 mod backend;
+#[cfg(feature = "cuda-native")]
+mod cuda_backend;
 mod engine;
 mod rate;
 mod scoring;
 mod session;
 mod types;
 
-pub use engine::{run_search, run_search_controlled};
+pub use engine::{run_search, run_search_controlled, run_search_with_budget};
+pub(crate) use session::resource_budget::ResourceBudgetSnapshot;
+pub(crate) use session::{DigitReaderPool, ResourceBudget};
 pub use types::{
-    BestMatchDetails, FinishReason, GenerationProgress, MatchMode, SearchCommand, SearchOptions,
-    SearchReporter, SearchSnapshot, TopMatch,
+    BackendSelectionError, BestMatchDetails, FinishReason, GenerationProgress, MatchMode,
+    SearchCommand, SearchOptions, SearchReporter, SearchSnapshot, SnapshotIncompatible, TopMatch,
 };
 
 #[cfg(test)]
@@ -60,6 +64,7 @@ mod tests {
     fn options(limit: Option<u64>) -> SearchOptions {
         SearchOptions {
             max_offset: None,
+            work_windows: None,
             limit,
             match_mode: MatchMode::Threshold,
             canvas_width: 2,
