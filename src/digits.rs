@@ -1,10 +1,13 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// What the producer behind a growing source is doing right now.
 ///
@@ -19,17 +22,84 @@ pub struct GenerationState {
     pub target_digits: u64,
 }
 
-pub trait DigitSource: Send {
+pub struct DigitRead {
+    pub digits: Vec<u8>,
+    pub read: Duration,
+    pub parse: Duration,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("pi cache publication at {path} is not searchable (sidecar status: {sidecar_status})")]
+pub struct CachePublicationError {
+    pub path: PathBuf,
+    pub sidecar_status: String,
+}
+
+pub(crate) struct ReaderPath<'a> {
+    pub path: &'a Path,
+    pub allow_decimal_prefix: bool,
+    pub missing_is_empty: bool,
+}
+
+pub trait DigitSource: Send + Sync {
     fn kind(&self) -> &'static str;
     fn len(&self) -> Result<u64>;
     fn validate(&self) -> Result<()>;
     fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
+    fn read_range_timed(&self, offset: u64, len: usize) -> Result<DigitRead> {
+        let started = Instant::now();
+        let digits = self.read_range(offset, len)?;
+        Ok(DigitRead {
+            digits,
+            read: started.elapsed(),
+            parse: Duration::ZERO,
+        })
+    }
+    fn read_range_into_timed(
+        &self,
+        offset: u64,
+        len: usize,
+        digits: &mut Vec<u8>,
+    ) -> Result<(Duration, Duration)> {
+        let read = self.read_range_timed(offset, len)?;
+        digits.clear();
+        digits.extend_from_slice(&read.digits);
+        Ok((read.read, read.parse))
+    }
+    fn reader_path(&self) -> Option<ReaderPath<'_>> {
+        None
+    }
     fn is_growing(&self) -> bool {
         false
     }
 
     fn request_prefetch(&self, _min_digits: u64) -> Result<()> {
         Ok(())
+    }
+
+    fn request_generation(
+        &self,
+        demand: crate::pi::GenerationDemand,
+        _budget: Arc<dyn crate::pi::GenerationBudget>,
+        _stop: Arc<AtomicBool>,
+    ) -> Result<crate::pi::GenerationMetrics> {
+        self.request_prefetch(demand.absolute_target)?;
+        Ok(crate::pi::GenerationMetrics::default())
+    }
+
+    fn prefetch_generation(
+        &self,
+        _demand: crate::pi::GenerationDemand,
+        _budget: Arc<dyn crate::pi::GenerationBudget>,
+        _stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn cancel_generation_waiters(&self) {}
+
+    fn generation_metrics(&self) -> Option<crate::pi::GenerationMetrics> {
+        None
     }
 
     /// `None` for sources that cannot grow, so callers can distinguish
@@ -90,9 +160,13 @@ impl DigitSourceSpec {
                     .source_path
                     .as_ref()
                     .ok_or_else(|| anyhow!("cache digit source is missing a path"))?;
-                Ok(Box::new(crate::pi::CachedGrowingPiSource::new(
-                    crate::pi::PiCache::new(PathBuf::from(path)),
-                )))
+                let path = PathBuf::from(path);
+                let cache = crate::pi::PiCache::new(path.clone());
+                ensure_searchable_cache(&cache)?;
+                Ok(Box::new(GrowingCacheDigitSource {
+                    inner: crate::pi::CachedGrowingPiSource::new(cache),
+                    path,
+                }))
             }
             other => bail!("unsupported digit source type {other:?}"),
         }
@@ -152,47 +226,28 @@ impl FileDigitSource {
         Ok(state.digits_seen)
     }
 
-    pub fn append_digits_from_to(&self, destination: &Path, start_digit: u64) -> Result<u64> {
-        let file = File::open(&self.path)
-            .with_context(|| format!("failed to open pi digit file {}", self.path.display()))?;
-        let mut reader = BufReader::new(file);
-        let output = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(destination)
-            .with_context(|| format!("failed to open {}", destination.display()))?;
-        let mut writer = BufWriter::new(output);
-        let mut state = ParseState::default();
-        let mut byte_offset = 0_u64;
-        let mut copied = 0_u64;
-        let mut buf = [0_u8; 64 * 1024];
-
-        loop {
-            let read = reader.read(&mut buf)?;
-            if read == 0 {
-                break;
-            }
-            for byte in &buf[..read] {
-                let digit_index = state.digits_seen;
-                if let Some(digit) =
-                    parse_source_byte(*byte, byte_offset, &mut state, self.allow_decimal_prefix)?
-                {
-                    if digit_index >= start_digit {
-                        writer.write_all(&[b'0' + digit])?;
-                        copied += 1;
-                    }
-                }
-                byte_offset += 1;
+    pub fn replace_cache(&self, cache: &crate::pi::PiCache) -> Result<u64> {
+        cache.ensure_parent()?;
+        let staged = cache.path().with_extension(format!(
+            "import-{}-{}.tmp",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let result = self
+            .copy_digits_to(&staged)
+            .and_then(|_| cache.replace_from_validated_source(&staged));
+        let cleanup = match std::fs::remove_file(&staged) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Err(error) => Err(error),
+            Ok(digits) => {
+                cleanup.with_context(|| format!("failed to remove {}", staged.display()))?;
+                Ok(digits)
             }
         }
-
-        writer.flush()?;
-        *self
-            .digit_len
-            .lock()
-            .map_err(|_| anyhow!("digit source length cache was poisoned"))? =
-            Some(state.digits_seen);
-        Ok(copied)
     }
 
     fn count_digits(&self) -> Result<u64> {
@@ -318,6 +373,97 @@ impl DigitSource for FileDigitSource {
         }
         Ok(out)
     }
+
+    fn reader_path(&self) -> Option<ReaderPath<'_>> {
+        Some(ReaderPath {
+            path: &self.path,
+            allow_decimal_prefix: self.allow_decimal_prefix,
+            missing_is_empty: false,
+        })
+    }
+}
+
+struct GrowingCacheDigitSource {
+    inner: crate::pi::CachedGrowingPiSource,
+    path: PathBuf,
+}
+
+impl DigitSource for GrowingCacheDigitSource {
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+
+    fn len(&self) -> Result<u64> {
+        self.inner.len()
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure_searchable_cache(&crate::pi::PiCache::new(self.path.clone()))
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.inner.read_range(offset, len)
+    }
+
+    fn read_range_timed(&self, offset: u64, len: usize) -> Result<DigitRead> {
+        self.inner.read_range_timed(offset, len)
+    }
+
+    fn is_growing(&self) -> bool {
+        true
+    }
+
+    fn request_prefetch(&self, min_digits: u64) -> Result<()> {
+        self.inner.request_prefetch(min_digits)
+    }
+
+    fn generation(&self) -> Option<GenerationState> {
+        self.inner.generation()
+    }
+
+    fn request_generation(
+        &self,
+        demand: crate::pi::GenerationDemand,
+        budget: Arc<dyn crate::pi::GenerationBudget>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<crate::pi::GenerationMetrics> {
+        self.inner.request_generation(demand, budget, stop)
+    }
+
+    fn prefetch_generation(
+        &self,
+        demand: crate::pi::GenerationDemand,
+        budget: Arc<dyn crate::pi::GenerationBudget>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<()> {
+        self.inner.prefetch_generation(demand, budget, stop)
+    }
+
+    fn cancel_generation_waiters(&self) {
+        self.inner.cancel_waiters();
+    }
+
+    fn generation_metrics(&self) -> Option<crate::pi::GenerationMetrics> {
+        self.inner.metrics().ok()
+    }
+
+    fn reader_path(&self) -> Option<ReaderPath<'_>> {
+        None
+    }
+}
+
+fn ensure_searchable_cache(cache: &crate::pi::PiCache) -> Result<()> {
+    let info = cache.info()?;
+    if info.sidecar_status == "ok" && info.valid_ascii
+        || info.sidecar_status == "missing" && info.raw_file_size == 0
+    {
+        return Ok(());
+    }
+    Err(CachePublicationError {
+        path: info.path,
+        sidecar_status: info.sidecar_status,
+    }
+    .into())
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +490,26 @@ impl DigitSource for DemoDigitSource {
         let end = (start + len).min(DEMO_PI_DIGITS.len());
         convert_ascii_digits(&DEMO_PI_DIGITS.as_bytes()[start..end])
     }
+
+    fn read_range_into_timed(
+        &self,
+        offset: u64,
+        len: usize,
+        digits: &mut Vec<u8>,
+    ) -> Result<(Duration, Duration)> {
+        let started = Instant::now();
+        digits.clear();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start < DEMO_PI_DIGITS.len() {
+            let end = start.saturating_add(len).min(DEMO_PI_DIGITS.len());
+            digits.extend(
+                DEMO_PI_DIGITS.as_bytes()[start..end]
+                    .iter()
+                    .map(|byte| byte - b'0'),
+            );
+        }
+        Ok((started.elapsed(), Duration::ZERO))
+    }
 }
 
 pub fn convert_ascii_digits(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -362,9 +528,9 @@ pub fn convert_ascii_digits(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct ParseState {
-    digits_seen: u64,
-    decimal_prefix_seen: bool,
+pub(crate) struct ParseState {
+    pub digits_seen: u64,
+    pub decimal_prefix_seen: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -374,7 +540,7 @@ struct FileReadCursor {
     state: ParseState,
 }
 
-fn parse_source_byte(
+pub(crate) fn parse_source_byte(
     byte: u8,
     byte_offset: u64,
     state: &mut ParseState,

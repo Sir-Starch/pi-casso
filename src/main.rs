@@ -1,12 +1,29 @@
 mod art;
+mod benchmark_build;
+mod benchmark_contract;
+#[cfg(test)]
+mod benchmark_contract_tests;
+mod benchmark_execute;
+mod benchmark_report;
+mod benchmark_runner;
+mod benchmark_stats;
+mod capability;
 mod cli;
 mod cli_output;
 mod commands;
 mod config;
+#[cfg(feature = "cuda-native")]
+mod cuda;
+#[cfg(feature = "cuda-native")]
+mod cuda_artifact;
+#[cfg(feature = "cuda-native")]
+mod cuda_engine;
 mod digits;
 mod gpu;
+mod gpu_ring;
 mod performance;
 mod pi;
+mod pi_benchmark;
 mod render;
 mod search;
 mod storage;
@@ -20,6 +37,9 @@ use crate::cli::Cli;
 fn main() {
     restore_default_sigpipe();
     if let Err(err) = real_main() {
+        if let Some(exit) = err.downcast_ref::<commands::CommandExit>() {
+            std::process::exit(exit.0);
+        }
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }

@@ -10,6 +10,8 @@ mod hunt;
 mod pi;
 mod runs;
 
+pub(crate) use hunt::prepare_resume_selected;
+
 use std::io::IsTerminal;
 
 use anyhow::Result;
@@ -25,6 +27,10 @@ pub struct CommandContext {
     pub theme: Theme,
     pub json: bool,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("command exited with status {0}")]
+pub struct CommandExit(pub i32);
 
 impl CommandContext {
     fn new(cli: &Cli) -> Self {
@@ -69,12 +75,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Benchmark(args) => bench::benchmark(args, &context),
         Commands::StressTest(args) => bench::stress_test(args, &context),
         Commands::Gpu { command } => match command {
-            GpuCommands::Info => {
-                gpu::info();
-                Ok(())
-            }
+            GpuCommands::Info => gpu::info(&context),
         },
-        Commands::Pi { command } => pi::dispatch(command),
+        Commands::Pi { command } => pi::dispatch(command, &context),
     }
 }
 

@@ -82,10 +82,7 @@ impl DataTab {
         let source = self.source()?;
         let cache = pi::PiCache::default()?;
         let destination = cache.path().clone();
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let digits = source.copy_digits_to(&destination)?;
+        let digits = source.replace_cache(&cache)?;
         self.validated_digits = Some(digits);
         Ok((digits, destination))
     }
@@ -126,7 +123,7 @@ impl DataTab {
                     theme,
                 ),
                 dim_line(
-                    "Imported digits are appended to the cache and become available to every run.",
+                    "Imported digits replace the cache and become available to every run.",
                     theme,
                 ),
                 dim_line(self.form.hint(), theme),

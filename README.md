@@ -93,7 +93,7 @@ It is the project’s only reliable source of long-term engagement.
 | **Targets** | Built-in `arch` and `pi` templates or custom ASCII art |
 | **Matching** | Emergence scoring and legacy threshold modes |
 | **Persistence** | SQLite runs plus a reusable local π cache |
-| **Acceleration** | Multithreaded CPU and optional `wgpu` compute |
+| **Acceleration** | Multithreaded CPU, optional WGPU, and capability-gated CUDA |
 | **Usefulness** | Statistically difficult to detect |
 
 ## Features
@@ -110,7 +110,8 @@ It is the project’s only reliable source of long-term engagement.
   running hunt and a `pi-casso list` never lock each other out
 - Persistent preferences in `$XDG_CONFIG_HOME/pi-casso/config.toml`
 - CPU resource and thermal controls
-- Optional GPU emergence scoring through `wgpu`
+- Optional GPU emergence scoring through WGPU, with a capability-gated native
+  CUDA path when a compatible PTX handoff is available
 - Plain output for scripts and servers
 - JSON export
 - Stress testing, because the joke apparently needed benchmarks
@@ -153,6 +154,14 @@ Resume it later:
 
 ```sh
 pi-casso resume arch-eternal
+```
+
+To resume with an explicit portable CPU choice and a bounded verification run:
+
+```sh
+pi-casso resume arch-eternal \
+  --backend cpu --gpu off \
+  --show-metrics
 ```
 
 ### Run a bounded file search
@@ -272,6 +281,15 @@ $XDG_DATA_HOME/pi-casso/pi-cache.txt
 Temporary y-cruncher output is removed after import. With
 `--generator-backend auto`, y-cruncher is used when available; otherwise
 `pi-casso` falls back to its built-in CPU generator.
+
+`--generator-backend y-cruncher` is different: it is an explicit request. If
+the executable cannot be validated, starts no generation work and returns a
+typed unavailable result instead of silently changing generators. Use `auto`
+when CPU fallback is acceptable, and inspect JSON output for
+`selected_variant`, `unavailable_backends`, `fallback`, and
+`fallback_reason`. A generator result is only comparable when its selected
+variant and workload are the same; an isolated digits/second number is not an
+end-to-end search result.
 
 ### Local digit files
 
@@ -428,6 +446,13 @@ correctness.
 | `max` | All-out search-flavoured stress test |
 | `custom` | Balanced defaults with manual overrides |
 
+Profiles are resource policies, not performance promises. They scale worker
+counts from the available logical CPUs and may be further limited by the
+thermal, battery, memory, queue, backend, and device choices. `eco` deliberately
+uses a zero GPU duty policy; `max` permits all available CPU workers and the
+largest configured GPU in-flight budget. Neither profile proves that the host
+has a usable GPU or that it will be faster.
+
 ```sh
 pi-casso hunt --template arch --name arch-eco --infinite --profile eco
 
@@ -461,6 +486,7 @@ pi-casso stress-test --stress-target cpu --stress-duration 60 --yes
 ```text
 --cpu-workers <n>
 --cpu-utilization <1-100>
+--gpu-utilization <1-100>
 --chunk-size <n>
 --queue-depth <n>
 --memory-limit-mb <n>
@@ -471,10 +497,35 @@ pi-casso stress-test --stress-target cpu --stress-duration 60 --yes
 --pause-when-on-battery
 ```
 
+`--gpu-utilization` is a bounded submission-duty policy, not a reading of GPU
+hardware utilization. `100` permits the configured in-flight budget, and lower
+values can add measured policy wait between submissions. The `eco` profile's
+zero duty policy disables GPU submission duty; the current explicit CLI override
+accepts `1..=100`. Queue depth and memory limit are hard resource controls: a
+run that cannot reserve its bounded working set reports a resource error before
+opening the digit source.
+
+### Resume and overrides
+
+```sh
+# Continue from the recorded checkpoint.
+pi-casso resume arch-eternal --show-metrics
+
+# Make the resumed run portable by requiring CPU execution.
+pi-casso resume arch-eternal --backend cpu --gpu off --cpu-workers 4
+```
+
+Resume continues from `current_offset`, never from the best-match offset. Use
+`--show-metrics` to confirm the profile, effective backend, queue, memory, and
+stop/wait fields selected for the resumed run. The current host is probed before
+accelerated work: if a requested backend is unavailable, inspect the typed
+capability result and choose CPU or `auto` intentionally.
+
 ### GPU backend
 
 The default emergence matcher can evaluate candidate `(window, placement)`
-scores in a `wgpu` compute shader.
+scores in a WGPU compute shader. Adapter selection happens at runtime, so the
+implementation is not tied to a particular GPU model or vendor.
 
 - `--backend auto` keeps small searches on the optimized CPU path and switches
   to GPU for larger emergence or stress workloads;
@@ -489,6 +540,107 @@ pi-casso gpu info
 pi-casso benchmark --template arch --seconds 10 --profile eco
 pi-casso benchmark --template arch --seconds 10 --profile performance --backend auto
 ```
+
+Check capability before treating a GPU result as evidence:
+
+```sh
+pi-casso --json gpu info
+pi-casso --json benchmark \
+  --template arch --source-mode finite --cache-state cold \
+  --work-windows 65536 --profile performance --backend auto
+```
+
+`auto` can select CPU for a small workload or after an unavailable accelerator
+preflight. An explicit `--backend gpu --gpu on` or `--backend cuda --gpu on`
+requires that backend to pass preflight; its structured result names the
+capability reason instead of presenting a CPU fallback as GPU work. JSON
+reports keep `requested_backend` separate from `resolved_backend`, and include
+the selected device, backend candidates, fallback state, and fault status.
+
+CUDA is capability-gated rather than inferred from a device name or the
+presence of a PTX file. `gpu info` reports the versioned capability state,
+driver/device observation, compute capability, and kernel-load status. The
+native CUDA path requires the compiled CUDA feature, a loadable `emergence`
+kernel, and a PTX handoff that the CUDA driver accepts for the selected device;
+the runtime does not require one exact GPU architecture. Unavailable
+drivers/devices, an incompatible PTX handoff, missing/invalid handoff
+artifacts, or a kernel load failure are explicit unavailable reasons. On
+machines without a compatible CUDA handoff, use WGPU or `--backend auto`.
+
+### Measured throughput
+
+The following is a local reference measurement, not a hardware guarantee. It
+uses the same `arch` workload for 1,048,576 windows, a 262,144-window
+accelerator chunk, and queue depth 4. The GPU numbers were measured on an RTX
+4080 SUPER only as the validation host; other GPUs should be benchmarked with
+the same command and workload.
+
+| Backend | Throughput |
+| --- | ---: |
+| CPU | 65.4K windows/s median |
+| WGPU validation host | 3.31M windows/s median, 3.17M p95 |
+
+Warm-cache end-to-end time was about 0.313 seconds. The controlled WGPU
+baseline was 57.9K windows/s; an earlier small-buffer run measured about
+7.9K windows/s. The optimized path submits 16 batches with up to four in
+flight and had about 1 ms of queue wait on this workload.
+
+Growing-cache searches have a different limit: when the search reaches the
+current end of the cache, throughput is governed by Pi generation. In the
+same local validation, growing end-to-end throughput was 48.3K windows/s with
+about 956K generated digits/s and 34.6 seconds of generation wait. The producer
+prefetches the next range while the accelerator scans, and the TUI reports
+that wait and generator rate instead of presenting it as a silent search hang.
+
+GitHub Actions intentionally compiles all test targets with `--no-run`; it does
+not generate Pi digits, execute searches, or run hardware benchmarks. It still
+checks formatting, Clippy, MSRV compatibility, release builds, and compilation
+of all-feature/all-target test binaries. Run the full runtime suite and GPU
+benchmarks locally on the target hardware.
+
+### Benchmark and metric interpretation
+
+Benchmark JSON is an audit record, not a leaderboard line. Use a fixed source
+mode, cache state, work-window budget, profile, and backend when comparing
+runs. With repetitions, the top-level report supplies median and p95 summaries
+and retains the individual raw repetitions.
+
+```sh
+pi-casso --json benchmark \
+  --template arch --source-mode growing --cache-state cold \
+  --work-windows 65536 --repetitions 5 --warmup 1 \
+  --profile performance --backend cpu --gpu off --show-metrics
+```
+
+Read the result in this order:
+
+- `status`, `reason`, `skip_reason`, `stop_reason`, and `workload_id` say
+  whether the requested workload actually ran and why it ended.
+- `requested_backend`, `resolved_backend`, `backend_device`, `fallback`, and
+  `fallback_reason` identify the route actually used.
+- `source_digits_per_second` measures source digits read per elapsed wall time.
+  `logical_window_digits_per_second` is window-expanded logical work and is
+  intentionally a different metric; do not compare the two as substitutes.
+- `stage_timings`, `waits`, generator/cache counters, queue occupancy, and
+  logical memory peak explain where time or bounded capacity went.
+- GPU submission/overlap fields describe the scheduler. A duty-policy percent,
+  `active_submission_ratio`, or a `test_only_mock` result is not measured
+  hardware utilization or hardware throughput.
+
+For generator comparisons, also require the reported generator backend,
+`selected_variant`, and executable hash to match (or deliberately differ) and
+compare end-to-end search waits as well as generated digits per second.
+
+### Troubleshooting runtime selection
+
+| Symptom | What to check | Safe next step |
+| --- | --- | --- |
+| GPU request is unavailable | `pi-casso --json gpu info` and the report `reason` | Use `--backend cpu --gpu off`, or use `--backend auto` when fallback is acceptable. |
+| CUDA request is unavailable | CUDA capability state, compute capability, and `kernel_load_status` | Do not treat PTX presence as proof; use CPU/auto unless preflight is `preflight_ok`. |
+| Auto chose CPU | `backend_candidates`, workload budget, and capability reason | Increase only a deliberately chosen benchmark workload; CPU selection is valid evidence. |
+| y-cruncher request failed | `unavailable_backends` and the typed reason | Fix the executable/import issue, or choose `--generator-backend auto` for CPU fallback. |
+| Resume cannot use saved accelerator | Requested versus resolved backend/device and the error reason | Resume with explicit `--backend auto`, or force `--backend cpu --gpu off`; progress remains checkpointed. |
+| Numbers look unexpectedly high | Metric name, source/cache state, warm-up/repetitions, and mock flag | Compare only identical workload identities and never present logical or mock metrics as hardware throughput. |
 
 ### TUI controls
 
