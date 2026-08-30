@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,6 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(any(unix, windows))]
-use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +76,8 @@ struct ObservedLock {
 
 pub(crate) struct WriterLock {
     path: PathBuf,
+    bytes: Vec<u8>,
+    _file: Option<File>,
     remove_on_drop: bool,
 }
 
@@ -86,27 +86,16 @@ impl WriterLock {
         let started = Instant::now();
         loop {
             match create_lock(&paths.lock) {
-                Ok(()) => {
-                    paths.sync_parent()?;
-                    return Ok(Self {
-                        path: paths.lock.clone(),
-                        remove_on_drop: true,
-                    });
-                }
+                Ok(locked) => return Self::from_locked(paths, locked),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     let observed = observe_lock(&paths.lock)?;
                     match observed.state {
                         LockState::Missing => continue,
                         #[cfg(any(unix, windows))]
                         LockState::Dead => {
-                            let current = observe_lock(&paths.lock)?;
-                            if current.state != LockState::Dead || current.bytes != observed.bytes {
-                                continue;
+                            if let Some(locked) = recover_dead_lock(&paths.lock, &observed)? {
+                                return Self::from_locked(paths, locked);
                             }
-                            fs::remove_file(&paths.lock).with_context(|| {
-                                format!("failed to remove dead lock {}", paths.lock.display())
-                            })?;
-                            paths.sync_parent()?;
                         }
                         LockState::Live if started.elapsed() < LIVE_LOCK_WAIT => {
                             thread::sleep(LOCK_RETRY);
@@ -120,6 +109,21 @@ impl WriterLock {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    fn from_locked(paths: &PublicationPaths, locked: LockedFile) -> Result<Self> {
+        let LockedFile { file, bytes } = locked;
+        if let Err(error) = paths.sync_parent() {
+            remove_owned_lock(&paths.lock, &bytes);
+            drop(file);
+            return Err(error);
+        }
+        Ok(Self {
+            path: paths.lock.clone(),
+            bytes,
+            _file: Some(file),
+            remove_on_drop: true,
+        })
     }
 
     pub(crate) fn fail_after_raw_sync(&mut self) -> Result<()> {
@@ -145,10 +149,7 @@ impl WriterLock {
 impl Drop for WriterLock {
     fn drop(&mut self) {
         if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
-            if let Some(parent) = self.path.parent() {
-                let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
-            }
+            remove_owned_lock(&self.path, &self.bytes);
         }
     }
 }
@@ -161,6 +162,8 @@ pub(crate) fn with_writer_lock<T>(
     if HELD_PATHS.with_borrow(|held| held.contains(&key)) {
         let mut nested = WriterLock {
             path: paths.lock.clone(),
+            bytes: Vec::new(),
+            _file: None,
             remove_on_drop: false,
         };
         return operation(&mut nested);
@@ -225,33 +228,36 @@ fn observe_lock(path: &Path) -> Result<ObservedLock> {
     })
 }
 
-fn create_lock(path: &Path) -> std::io::Result<()> {
-    let created_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?
-        .as_millis();
-    let record = LockRecord {
-        schema_version: 1,
-        pid: std::process::id(),
-        created_unix_ms: u64::try_from(created_unix_ms).map_err(std::io::Error::other)?,
-        #[cfg(target_os = "linux")]
-        pid_namespace: current_pid_namespace(),
-    };
-    let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+struct LockedFile {
+    file: File,
+    bytes: Vec<u8>,
+}
+
+fn create_lock(path: &Path) -> std::io::Result<LockedFile> {
+    let bytes = lock_record_bytes()?;
 
     #[cfg(windows)]
     {
-        let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)?;
         let result = (|| {
-            file.write_all(&bytes)?;
-            file.flush()?;
-            file.sync_all()
+            if !try_lock_file(&file)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "new pi cache lock could not be acquired",
+                ));
+            }
+            write_lock_record(&mut file, &bytes)
         })();
-        if result.is_err() {
+        if let Err(error) = result {
             drop(file);
             let _ = fs::remove_file(path);
+            return Err(error);
         }
-        return result;
+        return Ok(LockedFile { file, bytes });
     }
 
     #[cfg(not(windows))]
@@ -269,31 +275,154 @@ fn create_lock(path: &Path) -> std::io::Result<()> {
             std::process::id(),
             sequence
         ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&temp)?;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp)?;
-            file.write_all(&bytes)?;
-            file.flush()?;
-            file.sync_all()?;
+            if !try_lock_file(&file)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "new pi cache lock could not be acquired",
+                ));
+            }
+            write_lock_record(&mut file, &bytes)?;
             fs::hard_link(&temp, path)
         })();
         let cleanup = fs::remove_file(&temp);
         match result {
             Ok(()) => match cleanup {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(LockedFile { file, bytes }),
                 Err(error) => {
-                    let _ = fs::remove_file(path);
+                    remove_owned_lock(path, &bytes);
+                    drop(file);
                     Err(error)
                 }
             },
             Err(error) => {
+                drop(file);
                 let _ = cleanup;
                 Err(error)
             }
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+fn recover_dead_lock(path: &Path, observed: &ObservedLock) -> std::io::Result<Option<LockedFile>> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !try_lock_file(&file)? {
+        return Ok(None);
+    }
+    let current_bytes = read_lock_file(&mut file)?;
+    if current_bytes != observed.bytes {
+        return Ok(None);
+    }
+    let record =
+        serde_json::from_slice::<LockRecord>(&current_bytes).map_err(std::io::Error::other)?;
+    if record_state(&record).map_err(|error| std::io::Error::other(error.to_string()))?
+        != LockState::Dead
+    {
+        return Ok(None);
+    }
+    let bytes = lock_record_bytes()?;
+    write_lock_record(&mut file, &bytes)?;
+    Ok(Some(LockedFile { file, bytes }))
+}
+
+fn lock_record_bytes() -> std::io::Result<Vec<u8>> {
+    let created_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_millis();
+    let record = LockRecord {
+        schema_version: 1,
+        pid: std::process::id(),
+        created_unix_ms: u64::try_from(created_unix_ms).map_err(std::io::Error::other)?,
+        #[cfg(target_os = "linux")]
+        pid_namespace: current_pid_namespace(),
+    };
+    serde_json::to_vec(&record).map_err(std::io::Error::other)
+}
+
+fn read_lock_file(file: &mut File) -> std::io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn write_lock_record(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn remove_owned_lock(path: &Path, bytes: &[u8]) {
+    let owns_path = fs::read(path).is_ok_and(|current| current.as_slice() == bytes);
+    if owns_path && fs::remove_file(path).is_ok() {
+        if let Some(parent) = path.parent() {
+            let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EACCES || code == libc::EAGAIN => Ok(false),
+        _ => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn try_lock_file(_file: &File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 fn local_lock(path: &Path) -> Result<Arc<Mutex<()>>> {

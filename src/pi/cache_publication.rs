@@ -6,10 +6,6 @@ mod tests;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::time::Instant;
 
@@ -95,13 +91,19 @@ pub(crate) fn info(raw_path: &Path) -> Result<CacheSnapshot> {
 fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
     let paths = PublicationPaths::new(raw_path)?;
     let sidecar = read_sidecar(&paths.sidecar)?;
+    #[cfg(windows)]
+    let raw_file = open_file_if_present(&paths.raw)?;
+    #[cfg(not(windows))]
+    let raw_file: Option<File> = None;
     let raw_metadata = metadata_if_present(&paths.raw)?;
-    let sidecar_metadata = metadata_if_present(&paths.sidecar)?;
+    let raw_metadata = raw_file
+        .as_ref()
+        .map(File::metadata)
+        .transpose()?
+        .or(raw_metadata);
     let raw_file_size = raw_metadata.as_ref().map_or(0, fs::Metadata::len);
-    let raw_modified = modification_stamp(raw_metadata.as_ref());
-    let sidecar_modified = modification_stamp(sidecar_metadata.as_ref());
-    let raw_changed = change_stamp(raw_metadata.as_ref());
-    let sidecar_changed = change_stamp(sidecar_metadata.as_ref());
+    let raw_identity = snapshot::file_identity(raw_file.as_ref(), raw_metadata.as_ref());
+    let raw_fingerprint = snapshot::metadata_fingerprint(raw_file.as_ref(), raw_metadata.as_ref());
     let lock_state = lock::observe(&paths.lock)?;
 
     match sidecar {
@@ -113,10 +115,8 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 "missing",
                 None,
                 raw_file_size,
-                raw_modified,
-                raw_changed,
-                sidecar_modified,
-                sidecar_changed,
+                raw_identity.as_deref(),
+                raw_fingerprint.as_deref(),
             ),
         }),
         SidecarRead::Invalid => Ok(FastCacheSnapshot {
@@ -127,25 +127,35 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 "invalid",
                 None,
                 raw_file_size,
-                raw_modified,
-                raw_changed,
-                sidecar_modified,
-                sidecar_changed,
+                raw_identity.as_deref(),
+                raw_fingerprint.as_deref(),
             ),
         }),
         SidecarRead::Parsed(sidecar) => {
-            let raw_changed_after_publication = matches!(
-                (raw_modified, sidecar_modified),
-                (Some(raw), Some(sidecar)) if raw > sidecar
-            ) || matches!(
-                (raw_changed, sidecar_changed),
-                (Some(raw), Some(sidecar)) if raw > sidecar
-            );
             let exact_size = sidecar.raw_file_size == raw_file_size;
-            let active_prefix = matches!(lock_state, LockState::Live)
+            let exact = if exact_size {
+                match sidecar.raw_metadata_fingerprint.as_ref() {
+                    Some(expected) => raw_fingerprint.as_ref() == Some(expected),
+                    None => sidecar.matches_exact(&RawSnapshot::read(&paths.raw, None)?),
+                }
+            } else {
+                false
+            };
+            let active_prefix = if matches!(lock_state, LockState::Live)
                 && sidecar.published_digits == sidecar.raw_file_size
-                && sidecar.published_digits <= raw_file_size;
-            let status = if (exact_size && !raw_changed_after_publication) || active_prefix {
+                && sidecar.published_digits <= raw_file_size
+            {
+                match sidecar.raw_file_identity.as_ref() {
+                    Some(expected) => raw_identity.as_ref() == Some(expected),
+                    None => sidecar.matches_published_prefix(&RawSnapshot::read(
+                        &paths.raw,
+                        Some(sidecar.published_digits),
+                    )?),
+                }
+            } else {
+                false
+            };
+            let status = if exact || active_prefix {
                 "ok"
             } else {
                 "inconsistent"
@@ -158,10 +168,8 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                     status,
                     Some(&sidecar),
                     raw_file_size,
-                    raw_modified,
-                    raw_changed,
-                    sidecar_modified,
-                    sidecar_changed,
+                    raw_identity.as_deref(),
+                    raw_fingerprint.as_deref(),
                 ),
             })
         }
@@ -186,30 +194,14 @@ fn metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
     }
 }
 
-fn modification_stamp(metadata: Option<&fs::Metadata>) -> Option<u128> {
-    metadata?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_nanos())
-}
-
-fn change_stamp(metadata: Option<&fs::Metadata>) -> Option<u128> {
-    let metadata = metadata?;
-    #[cfg(unix)]
-    {
-        let seconds = u128::try_from(metadata.ctime()).ok()?;
-        let nanoseconds = u128::try_from(metadata.ctime_nsec()).ok()?;
-        return seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds);
-    }
-    #[cfg(windows)]
-    {
-        return Some(u128::from(metadata.last_write_time()));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
+#[cfg(windows)]
+fn open_file_if_present(path: &Path) -> Result<Option<File>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open pi cache {}", path.display()))
+        }
     }
 }
 
@@ -319,23 +311,21 @@ fn fast_snapshot_id(
     status: &str,
     sidecar: Option<&Sidecar>,
     raw_file_size: u64,
-    raw_modified: Option<u128>,
-    raw_changed: Option<u128>,
-    sidecar_modified: Option<u128>,
-    sidecar_changed: Option<u128>,
+    raw_identity: Option<&str>,
+    raw_fingerprint: Option<&str>,
 ) -> String {
     let sidecar = sidecar.map_or_else(String::new, |value| {
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{:?}:{:?}",
             value.schema_version,
             value.published_digits,
             value.raw_file_size,
-            value.published_prefix_sha256
+            value.published_prefix_sha256,
+            value.raw_file_identity.as_deref(),
+            value.raw_metadata_fingerprint.as_deref()
         )
     });
-    format!(
-        "{status}:{raw_file_size}:{raw_modified:?}:{raw_changed:?}:{sidecar_modified:?}:{sidecar_changed:?}:{sidecar}"
-    )
+    format!("{status}:{raw_file_size}:{raw_identity:?}:{raw_fingerprint:?}:{sidecar}")
 }
 
 pub(crate) fn append_digits(raw_path: &Path, digits: &[u8]) -> Result<()> {
@@ -493,7 +483,6 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
             return Ok(());
         }
         match sidecar {
-            SidecarRead::Parsed(sidecar) if sidecar.matches_exact(&raw) => {}
             SidecarRead::Parsed(sidecar) if sidecar.matches_published_prefix(&raw) => {
                 let file = OpenOptions::new().write(true).open(&paths.raw)?;
                 file.set_len(sidecar.published_digits)?;
@@ -502,8 +491,14 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
                 let repaired = RawSnapshot::read(&paths.raw, None)?;
                 write_sidecar(&paths, &Sidecar::from_raw(&repaired))?;
             }
-            SidecarRead::Missing | SidecarRead::Invalid | SidecarRead::Parsed(_) => {
+            SidecarRead::Parsed(sidecar) if raw.file_size < sidecar.raw_file_size => {
                 write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
+            }
+            SidecarRead::Missing | SidecarRead::Invalid => {
+                write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
+            }
+            SidecarRead::Parsed(_) => {
+                bail!("pi cache contents do not match the published sidecar")
             }
         }
         cleanup_previous(&paths)

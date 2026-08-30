@@ -100,3 +100,24 @@ fn repair_rewrites_sidecar_for_fast_readers() {
         vec![3; 32]
     );
 }
+
+#[test]
+fn repair_rejects_an_unpublished_same_size_mutation() {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    let root = tempdir().expect("cache publication root");
+    let raw = root.path().join("pi-cache.txt");
+    super::append_digits(&raw, &[3; 32]).expect("published cache");
+    fs::write(&raw, [b'9'; 32]).expect("same-size mutation");
+
+    let error = super::repair_publication(&raw).expect_err("mutation must not be re-signed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("do not match the published sidecar")
+    );
+    assert_eq!(fs::read(raw).expect("raw cache"), vec![b'9'; 32]);
+}
