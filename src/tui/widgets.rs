@@ -8,7 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Sparkline, Wrap,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
 use crate::render::Theme;
@@ -134,7 +134,8 @@ pub fn render_metric_lines(
             ),
             value,
             hint,
-        ]),
+        ])
+        .style(theme.canvas_bg_style()),
         area,
     );
 }
@@ -152,15 +153,19 @@ pub fn render_tab_bar(
     status_style: Style,
     theme: &Theme,
 ) -> Vec<Rect> {
-    let mut spans = vec![Span::raw(" ")];
+    let brand = " π-casso ";
+    let mut spans = vec![Span::styled(
+        brand,
+        theme.text_style().add_modifier(Modifier::BOLD),
+    )];
     let mut hit_areas = Vec::with_capacity(Tab::ALL.len());
-    let mut cursor = area.x + 1;
+    let mut cursor = area.x + brand.chars().count() as u16;
 
     for tab in Tab::ALL {
         let selected = tab == active;
         let label = if selected {
             format!(
-                "{} {} {}",
+                " {} {} {} ",
                 theme.glyphs.tab_marker,
                 tab.title(),
                 theme.glyphs.tab_marker
@@ -179,7 +184,7 @@ pub fn render_tab_bar(
         spans.push(Span::styled(
             label,
             if selected {
-                theme.accent_style().add_modifier(Modifier::BOLD)
+                theme.button_style()
             } else {
                 theme.dim_style()
             },
@@ -336,40 +341,6 @@ pub fn render_scroll_list(
     // Read after rendering: that is when ratatui has settled the offset needed
     // to keep the selection visible.
     RowRegion::panel(area, state.offset())
-}
-
-pub fn render_sparkline(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    data: &[u64],
-    label: &str,
-    theme: &Theme,
-) {
-    if data.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!("{label}: gathering samples"),
-                theme.dim_style(),
-            )),
-            area,
-        );
-        return;
-    }
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(label.chars().count() as u16 + 2),
-        ])
-        .split(area);
-    frame.render_widget(
-        Sparkline::default().data(data).style(theme.accent_style()),
-        columns[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::styled(format!(" {label}"), theme.dim_style())),
-        columns[1],
-    );
 }
 
 pub fn render_toasts(frame: &mut Frame<'_>, area: Rect, toasts: &Toasts, theme: &Theme) {

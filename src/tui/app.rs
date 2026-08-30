@@ -5,8 +5,6 @@
 //! action table, and — critically — no input handler here returns `Result`:
 //! a failure becomes a toast, never an exit.
 
-use std::collections::VecDeque;
-
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -33,10 +31,6 @@ use crate::tui::widgets::{
 };
 use crate::tui::worker::{SearchWorker, WorkerEvent, WorkerHandoffMarker};
 use crate::tui::{FramePolicy, PreparedResume, TuiLaunch};
-
-/// How many speed samples the sparkline keeps. At the default refresh this is
-/// roughly the last minute of the hunt.
-const SPEED_HISTORY: usize = 120;
 
 /// Hit areas from the last frame, keyed by what they contain.
 #[derive(Default)]
@@ -68,7 +62,6 @@ pub struct App {
     pub settings: SettingsTab,
     palette: Option<Palette>,
     help: bool,
-    speed_history: VecDeque<u64>,
     /// Where each interactive surface was drawn last frame. Mouse handling is
     /// only possible because drawing records this.
     regions: Regions,
@@ -116,7 +109,6 @@ impl App {
             data: DataTab::default(),
             palette: None,
             help: false,
-            speed_history: VecDeque::with_capacity(SPEED_HISTORY),
             regions: Regions::default(),
             should_quit: false,
             dirty: true,
@@ -712,7 +704,6 @@ impl App {
             prepared.options.performance.limits.max_fps,
             prepared.options.performance.limits.ui_refresh_ms,
         );
-        self.speed_history.clear();
         self.toasts
             .success(format!("hunting: {}", prepared.run.name));
         self.worker = Some(SearchWorker::start_prepared_start(prepared));
@@ -756,7 +747,6 @@ impl App {
             return;
         }
         self.frame_policy = FramePolicy::from_prepared_resume(&prepared);
-        self.speed_history.clear();
         self.toasts
             .success(format!("resuming {}", prepared.run.name));
         let run_id = prepared.run.id.clone();
@@ -807,7 +797,6 @@ impl App {
             return;
         }
         self.worker = None;
-        self.speed_history.clear();
         if let Err(err) = self.runs.reload() {
             self.toasts.error(format!("{err:#}"));
         }
@@ -850,13 +839,11 @@ impl App {
         let mut finished_reason = None;
         let mut new_bests = Vec::new();
         let mut error = None;
-        let mut samples = Vec::new();
 
         for event in events {
             match event {
                 WorkerEvent::Snapshot(snapshot) => {
                     worker.paused = snapshot.run.status == crate::storage::RunStatus::Paused;
-                    samples.push(snapshot.speed_windows_per_sec.max(0.0) as u64);
                     worker.latest = Some(*snapshot);
                 }
                 WorkerEvent::NewBest(event) => new_bests.push(*event),
@@ -873,12 +860,6 @@ impl App {
         }
 
         let quit_after_stop = worker.quit_after_stop;
-        for sample in samples {
-            if self.speed_history.len() == SPEED_HISTORY {
-                self.speed_history.pop_front();
-            }
-            self.speed_history.push_back(sample);
-        }
         for event in new_bests {
             self.toasts.success(format!(
                 "new best {:.2}% at offset {}",
@@ -929,11 +910,17 @@ impl App {
             return;
         }
 
+        let toast_height = if self.toasts.is_empty() {
+            0
+        } else {
+            self.toasts.visible().count() as u16 + 2
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(6),
+                Constraint::Length(toast_height),
                 Constraint::Length(2),
             ])
             .split(area);
@@ -961,18 +948,11 @@ impl App {
         match self.tab {
             Tab::Hunt => match &self.worker {
                 Some(worker) => {
-                    let history: Vec<u64> = self.speed_history.iter().copied().collect();
                     let dashboard_area = self
                         .resume_handoff
                         .as_ref()
                         .map_or(rows[1], |_| resume_dashboard_areas(rows[1])[1]);
-                    hunt::draw_dashboard(
-                        frame,
-                        dashboard_area,
-                        worker.latest.as_ref(),
-                        &history,
-                        &theme,
-                    );
+                    hunt::draw_dashboard(frame, dashboard_area, worker.latest.as_ref(), &theme);
                 }
                 None => regions.form = Some(self.hunt.draw_wizard(frame, rows[1], &theme)),
             },
@@ -982,7 +962,7 @@ impl App {
             Tab::Settings => regions.form = Some(self.settings.draw(frame, rows[1], &theme)),
         }
 
-        regions.buttons = render_status_bar(frame, rows[2], &self.status_hints(), &theme);
+        regions.buttons = render_status_bar(frame, rows[3], &self.status_hints(), &theme);
 
         if let Some(name) = self.runs.pending_delete.clone() {
             regions.confirm = self.draw_confirm(frame, area, &name);
@@ -991,7 +971,7 @@ impl App {
             self.draw_help(frame, area);
         }
         regions.palette = self.draw_palette(frame, area);
-        render_toasts(frame, rows[1], &self.toasts, &theme);
+        render_toasts(frame, rows[2], &self.toasts, &theme);
         if let Some(handoff) = &self.resume_handoff {
             let mut handoff_lines = vec![
                 Line::from(format!(
