@@ -145,13 +145,10 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 && sidecar.published_digits == sidecar.raw_file_size
                 && sidecar.published_digits <= raw_file_size
             {
-                match sidecar.raw_file_identity.as_ref() {
-                    Some(expected) => raw_identity.as_ref() == Some(expected),
-                    None => sidecar.matches_published_prefix(&RawSnapshot::read(
-                        &paths.raw,
-                        Some(sidecar.published_digits),
-                    )?),
-                }
+                sidecar.matches_published_prefix(&RawSnapshot::read(
+                    &paths.raw,
+                    Some(sidecar.published_digits),
+                )?)
             } else {
                 false
             };
@@ -469,6 +466,14 @@ pub(crate) fn replace_from_validated_source(raw_path: &Path, source: &Path) -> R
 }
 
 pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
+    repair_publication_inner(raw_path, false)
+}
+
+pub(crate) fn force_repair_publication(raw_path: &Path) -> Result<()> {
+    repair_publication_inner(raw_path, true)
+}
+
+fn repair_publication_inner(raw_path: &Path, allow_truncated_recovery: bool) -> Result<()> {
     let paths = PublicationPaths::new(raw_path)?;
     with_writer_lock(&paths, |_writer_lock| {
         let (raw, sidecar) = inspect(&paths.raw, &paths.sidecar)?;
@@ -492,6 +497,11 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
                 write_sidecar(&paths, &Sidecar::from_raw(&repaired))?;
             }
             SidecarRead::Parsed(sidecar) if raw.file_size < sidecar.raw_file_size => {
+                if !allow_truncated_recovery {
+                    bail!(
+                        "pi cache is shorter than the published sidecar; use explicit forced cache repair to accept it"
+                    );
+                }
                 write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
             }
             SidecarRead::Missing | SidecarRead::Invalid => {

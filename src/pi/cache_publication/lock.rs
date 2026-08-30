@@ -378,6 +378,8 @@ fn remove_owned_lock(path: &Path, bytes: &[u8]) {
 fn try_lock_file(file: &File) -> std::io::Result<bool> {
     use std::os::unix::io::AsRawFd;
 
+    // SAFETY: `file` owns a valid descriptor for the duration of this call;
+    // `flock` only changes the advisory lock state of that descriptor.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
         return Ok(true);
@@ -399,6 +401,8 @@ fn try_lock_file(file: &File) -> std::io::Result<bool> {
     use windows_sys::Win32::System::IO::OVERLAPPED;
 
     let mut overlapped = OVERLAPPED::default();
+    // SAFETY: `file` owns a valid handle and `overlapped` is a valid mutable
+    // zero-initialized structure for the synchronous, non-blocking call.
     let result = unsafe {
         LockFileEx(
             file.as_raw_handle(),
@@ -500,6 +504,8 @@ fn process_state(pid: u32) -> Result<LockState> {
             }
             let pid = libc::pid_t::try_from(pid)
                 .map_err(|_| anyhow!("pi cache writer lock pid does not fit this platform"))?;
+            // SAFETY: `pid` was checked for platform range; signal 0 probes
+            // liveness without delivering a signal or mutating the process.
             let result = unsafe { libc::kill(pid, 0) };
             if result == 0 {
                 return Ok(LockState::Live);
@@ -525,6 +531,8 @@ fn process_state(pid: u32) -> Result<LockState> {
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    // SAFETY: `OpenProcess` is called with a plain PID and read-only query
+    // access; the returned handle is closed on every path below.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
@@ -536,14 +544,18 @@ fn process_state(pid: u32) -> Result<LockState> {
     }
 
     let mut exit_code = 0;
+    // SAFETY: `handle` was returned by `OpenProcess`, and `exit_code` is a
+    // valid writable output buffer.
     let status = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
     if status == 0 {
         let error = std::io::Error::last_os_error();
+        // SAFETY: `handle` is the live handle returned above and is closed once.
         unsafe {
             CloseHandle(handle);
         }
         return Err(error.into());
     }
+    // SAFETY: `handle` is the live handle returned above and is closed once.
     unsafe {
         CloseHandle(handle);
     }
@@ -558,6 +570,8 @@ fn process_state(pid: u32) -> Result<LockState> {
 fn process_state(pid: u32) -> Result<LockState> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| anyhow!("pi cache writer lock pid does not fit this platform"))?;
+    // SAFETY: `pid` was checked for platform range; signal 0 probes liveness
+    // without delivering a signal or mutating the process.
     let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
         return Ok(LockState::Live);

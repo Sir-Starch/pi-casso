@@ -3,6 +3,8 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 #[cfg(test)]
@@ -122,10 +124,20 @@ impl RawSnapshot {
             if read == 0 {
                 break;
             }
-            let valid = buffer[..read]
+            let scan_len = prefix_limit
+                .map(|limit| {
+                    usize::try_from(limit.saturating_sub(prefix_bytes))
+                        .map(|remaining| remaining.min(read))
+                })
+                .transpose()?
+                .unwrap_or(read);
+            if scan_len == 0 {
+                break;
+            }
+            let valid = buffer[..scan_len]
                 .iter()
                 .position(|byte| !byte.is_ascii_digit())
-                .unwrap_or(read);
+                .unwrap_or(scan_len);
             full_hasher.update(&buffer[..valid]);
             if let (Some(limit), Some(hasher)) = (prefix_limit, prefix_hasher.as_mut()) {
                 let remaining = limit.saturating_sub(prefix_bytes);
@@ -134,8 +146,11 @@ impl RawSnapshot {
                 prefix_bytes = prefix_bytes.saturating_add(u64::try_from(take)?);
             }
             valid_digits = valid_digits.saturating_add(u64::try_from(valid)?);
-            if valid != read {
+            if valid != scan_len {
                 valid_ascii = false;
+                break;
+            }
+            if prefix_limit.is_some_and(|limit| prefix_bytes >= limit) {
                 break;
             }
         }
@@ -168,6 +183,8 @@ pub(super) fn file_identity(file: Option<&File>, metadata: Option<&Metadata>) ->
         let _ = metadata;
         let file = file?;
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a valid handle for the duration of this call and
+        // `information` is a valid writable buffer of the documented type.
         let result = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
         if result == 0 {
             return None;

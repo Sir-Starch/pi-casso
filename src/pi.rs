@@ -126,6 +126,11 @@ impl PiCache {
         cache_publication::repair_publication(&self.path)
     }
 
+    pub fn force_repair_publication(&self) -> Result<()> {
+        self.ensure_parent()?;
+        cache_publication::force_repair_publication(&self.path)
+    }
+
     fn with_publication_writer<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         cache_publication::lock::with_exclusive(&self.path, operation)
     }
