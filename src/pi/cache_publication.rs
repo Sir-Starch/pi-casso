@@ -449,14 +449,14 @@ pub(crate) fn replace_from_validated_source(raw_path: &Path, source: &Path) -> R
         ensure_writable(&paths)?;
         let staged = paths.unique_temp("replacement");
         let result = stage_validated_source(source, &staged).and_then(|digits| {
-            let staged_raw = RawSnapshot::read(&staged, None)?;
             backup_previous(&paths)?;
             replace_file(&staged, &paths.raw).with_context(|| {
                 format!("failed to publish replacement {}", paths.raw.display())
             })?;
             paths.sync_parent()?;
             writer_lock.fail_after_raw_sync()?;
-            write_sidecar(&paths, &Sidecar::from_raw(&staged_raw))?;
+            let published_raw = RawSnapshot::read(&paths.raw, None)?;
+            write_sidecar(&paths, &Sidecar::from_raw(&published_raw))?;
             writer_lock.fail_after_sidecar_rename()?;
             cleanup_previous(&paths)?;
             Ok(digits)
