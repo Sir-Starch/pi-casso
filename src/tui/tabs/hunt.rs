@@ -9,9 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Paragraph, Wrap};
+use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 
 use crate::art::{self, ArtMapping, Bitmap};
 use crate::benchmark_contract::{
@@ -36,7 +36,7 @@ use crate::tui::form::{Field, Form, FormOutcome};
 use crate::tui::live::{best_lines, history_lines};
 use crate::tui::widgets::{
     RowRegion, clip, dim_line, fit_segments, focused_panel, panel, render_metric,
-    render_metric_lines, render_sparkline,
+    render_metric_lines,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,7 +603,9 @@ impl HuntTab {
             Err(err) => vec![Line::styled(format!("{err}"), theme.dim_style())],
         };
         frame.render_widget(
-            Paragraph::new(preview_lines).block(panel("preview", theme)),
+            Paragraph::new(preview_lines)
+                .alignment(Alignment::Center)
+                .block(panel("preview", theme)),
             rows[0],
         );
         frame.render_widget(
@@ -621,7 +623,6 @@ pub fn draw_dashboard(
     frame: &mut Frame<'_>,
     area: Rect,
     snapshot: Option<&SearchSnapshot>,
-    speed_history: &[u64],
     theme: &Theme,
 ) {
     let Some(snapshot) = snapshot else {
@@ -642,8 +643,7 @@ pub fn draw_dashboard(
     let mut constraints = vec![
         Constraint::Length(1),
         Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Min(5),
+        Constraint::Min(8),
     ];
     if show_history {
         constraints.push(Constraint::Length(6));
@@ -658,13 +658,12 @@ pub fn draw_dashboard(
         rows[0],
     );
     draw_metrics(frame, rows[1], snapshot, theme);
-    render_sparkline(frame, rows[2], speed_history, "windows/s", theme);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(rows[3]);
-    let inner_height = rows[3].height.saturating_sub(2) as usize;
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[2]);
+    let inner_height = rows[2].height.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(bitmap_lines_fit(
             &snapshot.run.target_bitmap,
@@ -672,19 +671,20 @@ pub fn draw_dashboard(
             BitmapView::Plain,
             inner_height,
         ))
-        .block(panel("target", theme).style(theme.canvas_bg_style())),
+        .alignment(Alignment::Center)
+        .block(panel("target canvas", theme).style(theme.canvas_bg_style())),
         columns[0],
     );
     frame.render_widget(
         Paragraph::new(best_lines(&snapshot.run, theme, inner_height))
-            .block(panel("best pi manifestation", theme).style(theme.canvas_bg_style())),
+            .block(panel("best match / pi stream", theme).style(theme.canvas_bg_style())),
         columns[1],
     );
     if show_history {
         frame.render_widget(
             Paragraph::new(history_lines(&snapshot.recent_events, theme))
                 .block(panel("recent improvements", theme)),
-            rows[4],
+            rows[3],
         );
     }
 }
@@ -899,6 +899,16 @@ fn context_line(snapshot: &SearchSnapshot, area: Rect, theme: &Theme) -> Line<'s
         (format!("  {}", run.match_mode.as_str()), theme.text_style()),
         (
             format!(
+                "  {} / {} / {}w / {}",
+                snapshot.metrics.search_backend,
+                snapshot.metrics.profile.as_str(),
+                snapshot.metrics.cpu_workers,
+                snapshot.metrics.thermal_mode.as_str()
+            ),
+            theme.dim_style(),
+        ),
+        (
+            format!(
                 "  runtime {}",
                 fmt_duration(Duration::from_secs_f64(run.total_runtime_secs))
             ),
@@ -910,25 +920,27 @@ fn context_line(snapshot: &SearchSnapshot, area: Rect, theme: &Theme) -> Line<'s
 
 fn draw_metrics(frame: &mut Frame<'_>, area: Rect, snapshot: &SearchSnapshot, theme: &Theme) {
     let run = &snapshot.run;
+    frame.render_widget(Block::default().style(theme.canvas_bg_style()), area);
     let cells = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 5); 5])
+        .constraints([Constraint::Ratio(1, 4); 4])
         .split(area);
 
     render_metric(
         frame,
         cells[0],
-        "offset",
+        "progress",
         fmt_count(run.current_offset, theme.unicode),
-        format!("{} scanned", fmt_count(run.scanned_windows, theme.unicode)),
+        format!(
+            "{} windows scanned",
+            fmt_count(run.scanned_windows, theme.unicode)
+        ),
         theme,
     );
-    // Headline is the rolling rate; the session average is the small print,
-    // because "how fast is it right now" is the question being asked.
     render_metric(
         frame,
         cells[1],
-        "speed",
+        "throughput",
         format!("{}/s", fmt_rate(snapshot.speed_windows_per_sec)),
         format!("avg {}/s", fmt_rate(snapshot.average_windows_per_sec)),
         theme,
@@ -943,7 +955,7 @@ fn draw_metrics(frame: &mut Frame<'_>, area: Rect, snapshot: &SearchSnapshot, th
         ])
         .split(cells[2]);
     frame.render_widget(
-        Paragraph::new(Line::styled("BEST", theme.dim_style())),
+        Paragraph::new(Line::styled("BEST SCORE", theme.dim_style())),
         gauge_rows[0],
     );
     frame.render_widget(
@@ -965,22 +977,6 @@ fn draw_metrics(frame: &mut Frame<'_>, area: Rect, snapshot: &SearchSnapshot, th
     );
 
     draw_cache_metric(frame, cells[3], snapshot, theme);
-    render_metric(
-        frame,
-        cells[4],
-        "engine",
-        format!(
-            "{} {}",
-            snapshot.metrics.search_backend,
-            snapshot.metrics.profile.as_str()
-        ),
-        format!(
-            "{}w  {}",
-            snapshot.metrics.cpu_workers,
-            snapshot.metrics.thermal_mode.as_str()
-        ),
-        theme,
-    );
 }
 
 /// The cache metric carries the answer to "why is nothing happening": when the

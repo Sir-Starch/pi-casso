@@ -5,7 +5,7 @@
 use anyhow::Result;
 use ratatui::Terminal;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::time::{Duration, Instant};
 
@@ -223,13 +223,18 @@ pub(crate) fn history_lines(events: &[BestEventRecord], theme: &Theme) -> Vec<Li
         .rev()
         .take(6)
         .map(|event| {
-            Line::raw(format!(
-                "{}  offset={}  score={:.2}%  scanned={}",
-                event.timestamp,
-                event.offset,
-                event.score * 100.0,
-                event.scanned_windows
-            ))
+            Line::from(vec![
+                Span::styled(format!("{} ", theme.glyphs.rising), theme.success_style()),
+                Span::styled(format!("{:.2}%", event.score * 100.0), theme.text_style()),
+                Span::styled(
+                    format!(
+                        "  offset {}  ·  {} scanned",
+                        fmt_count(event.offset, theme.unicode),
+                        fmt_count(event.scanned_windows, theme.unicode)
+                    ),
+                    theme.dim_style(),
+                ),
+            ])
         })
         .collect()
 }
