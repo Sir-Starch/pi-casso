@@ -86,7 +86,7 @@ fn cache_repair(force: bool) -> Result<()> {
         bail!("cache repair requires --force");
     }
     let cache = pi::PiCache::default()?;
-    cache.repair_publication()?;
+    cache.force_repair_publication()?;
     println!("repaired cache publication at {}", cache.path().display());
     Ok(())
 }

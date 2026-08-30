@@ -20,6 +20,7 @@ or cautionary states.
 | Danger | `danger` | `#ED7075` | `#BE363A` | Errors and exhausted sources |
 | Canvas | `canvas_bg` | `#121B1C` | `#EDF4F1` | Bitmap surfaces and metric strip |
 | Target window | `canvas_target_bg` | `#1C2F2E` | `#DCEDE6` | Search placement context |
+| Canvas noise | `canvas_noise` | `#4B5C5B` | `#97ABA5` | Non-signal digits in raw canvas views |
 
 Accent is for navigation and primary data only. Status colors are semantic,
 not decorative. `mono` keeps the same layout and relies on reverse video and
@@ -75,6 +76,9 @@ feedback never obscures the target, match, or history.
   pi cache.
 - **States**: normal, generating, paused, no match, source exhausted.
 - **Layout**: three rows; the value is always above its explanation.
+
+Raw digit canvases use `canvas_noise` for non-signal characters so the target
+pattern and highlighted matches remain the visual focus.
 
 ### Canvas panel
 

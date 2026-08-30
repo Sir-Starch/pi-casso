@@ -712,8 +712,8 @@ is keyboard-only.
 Throughput is reported **over the last few seconds**, with the session average as
 small print beneath it. A cumulative average barely moves when a search slows
 down and never visibly recovers, which makes it useless for the question people
-actually ask — so switching profile with `p` shows up in the headline number and
-the sparkline right away.
+actually ask — so switching profile with `p` shows up in the headline number right
+away.
 
 The π cache metric distinguishes the two reasons a search might pause. When the
 search outruns the generator it reads `+69.0K/s, 4.3M to go` — digits are being

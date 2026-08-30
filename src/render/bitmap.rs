@@ -213,9 +213,9 @@ pub fn digit_canvas_lines(
                     .fg(theme.warning)
                     .add_modifier(Modifier::BOLD)
             } else if in_target {
-                Style::default().fg(theme.dim).bg(theme.canvas_target_bg)
+                theme.canvas_noise_style().bg(theme.canvas_target_bg)
             } else {
-                Style::default().fg(theme.dim)
+                theme.canvas_noise_style()
             };
             spans.push(Span::styled(ch.to_string(), style));
         }

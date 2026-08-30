@@ -91,11 +91,19 @@ pub(crate) fn info(raw_path: &Path) -> Result<CacheSnapshot> {
 fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
     let paths = PublicationPaths::new(raw_path)?;
     let sidecar = read_sidecar(&paths.sidecar)?;
+    #[cfg(windows)]
+    let raw_file = open_file_if_present(&paths.raw)?;
+    #[cfg(not(windows))]
+    let raw_file: Option<File> = None;
     let raw_metadata = metadata_if_present(&paths.raw)?;
-    let sidecar_metadata = metadata_if_present(&paths.sidecar)?;
+    let raw_metadata = raw_file
+        .as_ref()
+        .map(File::metadata)
+        .transpose()?
+        .or(raw_metadata);
     let raw_file_size = raw_metadata.as_ref().map_or(0, fs::Metadata::len);
-    let raw_modified = modification_stamp(raw_metadata.as_ref());
-    let sidecar_modified = modification_stamp(sidecar_metadata.as_ref());
+    let raw_identity = snapshot::file_identity(raw_file.as_ref(), raw_metadata.as_ref());
+    let raw_fingerprint = snapshot::metadata_fingerprint(raw_file.as_ref(), raw_metadata.as_ref());
     let lock_state = lock::observe(&paths.lock)?;
 
     match sidecar {
@@ -107,8 +115,8 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 "missing",
                 None,
                 raw_file_size,
-                raw_modified,
-                sidecar_modified,
+                raw_identity.as_deref(),
+                raw_fingerprint.as_deref(),
             ),
         }),
         SidecarRead::Invalid => Ok(FastCacheSnapshot {
@@ -119,20 +127,32 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 "invalid",
                 None,
                 raw_file_size,
-                raw_modified,
-                sidecar_modified,
+                raw_identity.as_deref(),
+                raw_fingerprint.as_deref(),
             ),
         }),
         SidecarRead::Parsed(sidecar) => {
-            let raw_changed_after_publication = matches!(
-                (raw_modified, sidecar_modified),
-                (Some(raw), Some(sidecar)) if raw > sidecar
-            );
             let exact_size = sidecar.raw_file_size == raw_file_size;
-            let active_prefix = matches!(lock_state, LockState::Live)
+            let exact = if exact_size {
+                match sidecar.raw_metadata_fingerprint.as_ref() {
+                    Some(expected) => raw_fingerprint.as_ref() == Some(expected),
+                    None => sidecar.matches_exact(&RawSnapshot::read(&paths.raw, None)?),
+                }
+            } else {
+                false
+            };
+            let active_prefix = if matches!(lock_state, LockState::Live)
                 && sidecar.published_digits == sidecar.raw_file_size
-                && sidecar.published_digits <= raw_file_size;
-            let status = if (exact_size && !raw_changed_after_publication) || active_prefix {
+                && sidecar.published_digits <= raw_file_size
+            {
+                sidecar.matches_published_prefix(&RawSnapshot::read(
+                    &paths.raw,
+                    Some(sidecar.published_digits),
+                )?)
+            } else {
+                false
+            };
+            let status = if exact || active_prefix {
                 "ok"
             } else {
                 "inconsistent"
@@ -145,8 +165,8 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                     status,
                     Some(&sidecar),
                     raw_file_size,
-                    raw_modified,
-                    sidecar_modified,
+                    raw_identity.as_deref(),
+                    raw_fingerprint.as_deref(),
                 ),
             })
         }
@@ -171,13 +191,15 @@ fn metadata_if_present(path: &Path) -> Result<Option<fs::Metadata>> {
     }
 }
 
-fn modification_stamp(metadata: Option<&fs::Metadata>) -> Option<u128> {
-    metadata?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_nanos())
+#[cfg(windows)]
+fn open_file_if_present(path: &Path) -> Result<Option<File>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to open pi cache {}", path.display()))
+        }
+    }
 }
 
 pub(crate) fn read_range_timed(raw_path: &Path, offset: u64, len: usize) -> Result<DigitRead> {
@@ -286,19 +308,21 @@ fn fast_snapshot_id(
     status: &str,
     sidecar: Option<&Sidecar>,
     raw_file_size: u64,
-    raw_modified: Option<u128>,
-    sidecar_modified: Option<u128>,
+    raw_identity: Option<&str>,
+    raw_fingerprint: Option<&str>,
 ) -> String {
     let sidecar = sidecar.map_or_else(String::new, |value| {
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{:?}:{:?}",
             value.schema_version,
             value.published_digits,
             value.raw_file_size,
-            value.published_prefix_sha256
+            value.published_prefix_sha256,
+            value.raw_file_identity.as_deref(),
+            value.raw_metadata_fingerprint.as_deref()
         )
     });
-    format!("{status}:{raw_file_size}:{raw_modified:?}:{sidecar_modified:?}:{sidecar}")
+    format!("{status}:{raw_file_size}:{raw_identity:?}:{raw_fingerprint:?}:{sidecar}")
 }
 
 pub(crate) fn append_digits(raw_path: &Path, digits: &[u8]) -> Result<()> {
@@ -422,14 +446,14 @@ pub(crate) fn replace_from_validated_source(raw_path: &Path, source: &Path) -> R
         ensure_writable(&paths)?;
         let staged = paths.unique_temp("replacement");
         let result = stage_validated_source(source, &staged).and_then(|digits| {
-            let staged_raw = RawSnapshot::read(&staged, None)?;
             backup_previous(&paths)?;
             replace_file(&staged, &paths.raw).with_context(|| {
                 format!("failed to publish replacement {}", paths.raw.display())
             })?;
             paths.sync_parent()?;
             writer_lock.fail_after_raw_sync()?;
-            write_sidecar(&paths, &Sidecar::from_raw(&staged_raw))?;
+            let published_raw = RawSnapshot::read(&paths.raw, None)?;
+            write_sidecar(&paths, &Sidecar::from_raw(&published_raw))?;
             writer_lock.fail_after_sidecar_rename()?;
             cleanup_previous(&paths)?;
             Ok(digits)
@@ -442,6 +466,14 @@ pub(crate) fn replace_from_validated_source(raw_path: &Path, source: &Path) -> R
 }
 
 pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
+    repair_publication_inner(raw_path, false)
+}
+
+pub(crate) fn force_repair_publication(raw_path: &Path) -> Result<()> {
+    repair_publication_inner(raw_path, true)
+}
+
+fn repair_publication_inner(raw_path: &Path, allow_truncated_recovery: bool) -> Result<()> {
     let paths = PublicationPaths::new(raw_path)?;
     with_writer_lock(&paths, |_writer_lock| {
         let (raw, sidecar) = inspect(&paths.raw, &paths.sidecar)?;
@@ -449,21 +481,34 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
             bail!("pi cache contains non-ASCII digit data and cannot be repaired");
         }
         if matches!(&sidecar, SidecarRead::Parsed(value) if value.matches_exact(&raw)) {
+            write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
             return cleanup_previous(&paths);
         }
         if restore_previous(&paths)? {
             return Ok(());
         }
         match sidecar {
-            SidecarRead::Parsed(sidecar) if sidecar.matches_exact(&raw) => {}
             SidecarRead::Parsed(sidecar) if sidecar.matches_published_prefix(&raw) => {
                 let file = OpenOptions::new().write(true).open(&paths.raw)?;
                 file.set_len(sidecar.published_digits)?;
                 sync_publication_data(&file)?;
                 paths.sync_parent()?;
+                let repaired = RawSnapshot::read(&paths.raw, None)?;
+                write_sidecar(&paths, &Sidecar::from_raw(&repaired))?;
             }
-            SidecarRead::Missing | SidecarRead::Invalid | SidecarRead::Parsed(_) => {
+            SidecarRead::Parsed(sidecar) if raw.file_size < sidecar.raw_file_size => {
+                if !allow_truncated_recovery {
+                    bail!(
+                        "pi cache is shorter than the published sidecar; use explicit forced cache repair to accept it"
+                    );
+                }
                 write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
+            }
+            SidecarRead::Missing | SidecarRead::Invalid => {
+                write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
+            }
+            SidecarRead::Parsed(_) => {
+                bail!("pi cache contents do not match the published sidecar")
             }
         }
         cleanup_previous(&paths)
@@ -474,7 +519,7 @@ pub(crate) fn validate_reset_lock(raw_path: &Path) -> Result<()> {
     let paths = PublicationPaths::new(raw_path)?;
     match lock::observe(&paths.lock)? {
         LockState::Missing => Ok(()),
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(unix, windows))]
         LockState::Dead => Ok(()),
         LockState::Live => bail!("pi cache writer lock belongs to a live process"),
         LockState::Unverifiable => bail!("pi cache writer lock cannot be verified"),
