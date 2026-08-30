@@ -61,14 +61,12 @@ fn published_digit_count_does_not_rescan_the_published_cache() {
 fn repair_rewrites_sidecar_for_fast_readers() {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::time::Duration;
 
     use tempfile::tempdir;
 
     let root = tempdir().expect("cache publication root");
     let raw = root.path().join("pi-cache.txt");
     super::append_digits(&raw, &[3; 32]).expect("published cache");
-    std::thread::sleep(Duration::from_millis(10));
 
     let mut file = OpenOptions::new()
         .append(true)

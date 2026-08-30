@@ -20,7 +20,7 @@ use crate::benchmark_contract::{
 };
 use crate::capability::GpuCapability;
 use crate::config::Config;
-use crate::digits::DigitSourceSpec;
+use crate::digits::{CachePublicationError, DigitSourceSpec};
 use crate::performance::{
     GeneratorBackendChoice, GpuMode, PerformanceOverrides, PerformanceProfile, PerformanceSettings,
     SearchBackendChoice, ThermalMode,
@@ -807,7 +807,11 @@ fn materialize_source_inner(source: StartDigitSource) -> Result<(DigitSourceSpec
             cache.ensure_parent()?;
             let generated_digit_count = match cache.published_digit_count() {
                 Ok(count) => count,
-                Err(publication_error) => {
+                Err(publication_error)
+                    if publication_error
+                        .downcast_ref::<CachePublicationError>()
+                        .is_some() =>
+                {
                     cache.repair_publication().with_context(|| {
                         format!(
                             "could not recover pi cache after publication error: {publication_error:#}"
@@ -815,6 +819,7 @@ fn materialize_source_inner(source: StartDigitSource) -> Result<(DigitSourceSpec
                     })?;
                     cache.published_digit_count()?
                 }
+                Err(error) => return Err(error),
             };
             (DigitSourceSpec::cache(path), generated_digit_count)
         }
@@ -1400,7 +1405,6 @@ mod tests {
     fn materialize_source_repairs_stale_cache_before_start() {
         use std::fs::OpenOptions;
         use std::io::Write;
-        use std::time::Duration;
 
         use tempfile::tempdir;
 
@@ -1408,7 +1412,6 @@ mod tests {
         let raw = root.path().join("pi-cache.txt");
         let cache = pi::PiCache::new(raw.clone());
         cache.append_digits(&[3; 32]).expect("published cache");
-        std::thread::sleep(Duration::from_millis(10));
 
         let mut file = OpenOptions::new()
             .append(true)

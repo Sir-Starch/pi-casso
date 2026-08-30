@@ -477,7 +477,7 @@ pub(crate) fn validate_reset_lock(raw_path: &Path) -> Result<()> {
     let paths = PublicationPaths::new(raw_path)?;
     match lock::observe(&paths.lock)? {
         LockState::Missing => Ok(()),
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(any(unix, windows))]
         LockState::Dead => Ok(()),
         LockState::Live => bail!("pi cache writer lock belongs to a live process"),
         LockState::Unverifiable => bail!("pi cache writer lock cannot be verified"),

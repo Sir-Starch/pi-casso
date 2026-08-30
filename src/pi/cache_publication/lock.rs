@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(unix, windows))]
 use anyhow::Context;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ thread_local! {
 pub(crate) enum LockState {
     Missing,
     Live,
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(unix, windows))]
     Dead,
     Unverifiable,
 }
@@ -86,7 +86,7 @@ impl WriterLock {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     match observe(&paths.lock)? {
                         LockState::Missing => continue,
-                        #[cfg(any(target_os = "linux", windows))]
+                        #[cfg(any(unix, windows))]
                         LockState::Dead => {
                             fs::remove_file(&paths.lock).with_context(|| {
                                 format!("failed to remove dead lock {}", paths.lock.display())
@@ -333,7 +333,23 @@ fn process_state(pid: u32) -> Result<LockState> {
     }
 }
 
-#[cfg(all(not(target_os = "linux"), not(windows)))]
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_state(pid: u32) -> Result<LockState> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| anyhow!("pi cache writer lock pid does not fit this platform"))?;
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return Ok(LockState::Live);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ESRCH => Ok(LockState::Dead),
+        Some(code) if code == libc::EPERM => Ok(LockState::Unverifiable),
+        _ => Err(error.into()),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn process_state(pid: u32) -> Result<LockState> {
     if pid == std::process::id() {
         Ok(LockState::Live)
