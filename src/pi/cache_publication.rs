@@ -6,6 +6,10 @@ mod tests;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::time::Instant;
 
@@ -96,6 +100,8 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
     let raw_file_size = raw_metadata.as_ref().map_or(0, fs::Metadata::len);
     let raw_modified = modification_stamp(raw_metadata.as_ref());
     let sidecar_modified = modification_stamp(sidecar_metadata.as_ref());
+    let raw_changed = change_stamp(raw_metadata.as_ref());
+    let sidecar_changed = change_stamp(sidecar_metadata.as_ref());
     let lock_state = lock::observe(&paths.lock)?;
 
     match sidecar {
@@ -108,7 +114,9 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 None,
                 raw_file_size,
                 raw_modified,
+                raw_changed,
                 sidecar_modified,
+                sidecar_changed,
             ),
         }),
         SidecarRead::Invalid => Ok(FastCacheSnapshot {
@@ -120,12 +128,17 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                 None,
                 raw_file_size,
                 raw_modified,
+                raw_changed,
                 sidecar_modified,
+                sidecar_changed,
             ),
         }),
         SidecarRead::Parsed(sidecar) => {
             let raw_changed_after_publication = matches!(
                 (raw_modified, sidecar_modified),
+                (Some(raw), Some(sidecar)) if raw > sidecar
+            ) || matches!(
+                (raw_changed, sidecar_changed),
                 (Some(raw), Some(sidecar)) if raw > sidecar
             );
             let exact_size = sidecar.raw_file_size == raw_file_size;
@@ -146,7 +159,9 @@ fn fast_info(raw_path: &Path) -> Result<FastCacheSnapshot> {
                     Some(&sidecar),
                     raw_file_size,
                     raw_modified,
+                    raw_changed,
                     sidecar_modified,
+                    sidecar_changed,
                 ),
             })
         }
@@ -178,6 +193,24 @@ fn modification_stamp(metadata: Option<&fs::Metadata>) -> Option<u128> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_nanos())
+}
+
+fn change_stamp(metadata: Option<&fs::Metadata>) -> Option<u128> {
+    let metadata = metadata?;
+    #[cfg(unix)]
+    {
+        let seconds = u128::try_from(metadata.ctime()).ok()?;
+        let nanoseconds = u128::try_from(metadata.ctime_nsec()).ok()?;
+        return seconds.checked_mul(1_000_000_000)?.checked_add(nanoseconds);
+    }
+    #[cfg(windows)]
+    {
+        return Some(u128::from(metadata.last_write_time()));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 pub(crate) fn read_range_timed(raw_path: &Path, offset: u64, len: usize) -> Result<DigitRead> {
@@ -287,7 +320,9 @@ fn fast_snapshot_id(
     sidecar: Option<&Sidecar>,
     raw_file_size: u64,
     raw_modified: Option<u128>,
+    raw_changed: Option<u128>,
     sidecar_modified: Option<u128>,
+    sidecar_changed: Option<u128>,
 ) -> String {
     let sidecar = sidecar.map_or_else(String::new, |value| {
         format!(
@@ -298,7 +333,9 @@ fn fast_snapshot_id(
             value.published_prefix_sha256
         )
     });
-    format!("{status}:{raw_file_size}:{raw_modified:?}:{sidecar_modified:?}:{sidecar}")
+    format!(
+        "{status}:{raw_file_size}:{raw_modified:?}:{raw_changed:?}:{sidecar_modified:?}:{sidecar_changed:?}:{sidecar}"
+    )
 }
 
 pub(crate) fn append_digits(raw_path: &Path, digits: &[u8]) -> Result<()> {

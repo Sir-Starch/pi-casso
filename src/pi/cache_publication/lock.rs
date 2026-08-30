@@ -2,6 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +66,14 @@ struct LockRecord {
     schema_version: u8,
     pid: u32,
     created_unix_ms: u64,
+    #[cfg(target_os = "linux")]
+    #[serde(default)]
+    pid_namespace: Option<u64>,
+}
+
+struct ObservedLock {
+    bytes: Vec<u8>,
+    state: LockState,
 }
 
 pub(crate) struct WriterLock {
@@ -84,10 +94,15 @@ impl WriterLock {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match observe(&paths.lock)? {
+                    let observed = observe_lock(&paths.lock)?;
+                    match observed.state {
                         LockState::Missing => continue,
                         #[cfg(any(unix, windows))]
                         LockState::Dead => {
+                            let current = observe_lock(&paths.lock)?;
+                            if current.state != LockState::Dead || current.bytes != observed.bytes {
+                                continue;
+                            }
                             fs::remove_file(&paths.lock).with_context(|| {
                                 format!("failed to remove dead lock {}", paths.lock.display())
                             })?;
@@ -178,20 +193,36 @@ pub(crate) fn with_exclusive<T>(
 }
 
 pub(crate) fn observe(path: &Path) -> Result<LockState> {
+    Ok(observe_lock(path)?.state)
+}
+
+fn observe_lock(path: &Path) -> Result<ObservedLock> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LockState::Missing);
+            return Ok(ObservedLock {
+                bytes: Vec::new(),
+                state: LockState::Missing,
+            });
         }
         Err(error) => return Err(error.into()),
     };
     let Ok(record) = serde_json::from_slice::<LockRecord>(&bytes) else {
-        return Ok(LockState::Unverifiable);
+        return Ok(ObservedLock {
+            bytes,
+            state: LockState::Unverifiable,
+        });
     };
     if record.schema_version != 1 || record.pid == 0 || record.created_unix_ms == 0 {
-        return Ok(LockState::Unverifiable);
+        return Ok(ObservedLock {
+            bytes,
+            state: LockState::Unverifiable,
+        });
     }
-    process_state(record.pid)
+    Ok(ObservedLock {
+        bytes,
+        state: record_state(&record)?,
+    })
 }
 
 fn create_lock(path: &Path) -> std::io::Result<()> {
@@ -203,6 +234,8 @@ fn create_lock(path: &Path) -> std::io::Result<()> {
         schema_version: 1,
         pid: std::process::id(),
         created_unix_ms: u64::try_from(created_unix_ms).map_err(std::io::Error::other)?,
+        #[cfg(target_os = "linux")]
+        pid_namespace: current_pid_namespace(),
     };
     let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
 
@@ -286,10 +319,69 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn record_state(record: &LockRecord) -> Result<LockState> {
+    if record.pid_namespace.is_none() || record.pid_namespace != current_pid_namespace() {
+        return Ok(LockState::Unverifiable);
+    }
+    process_state(record.pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_state(record: &LockRecord) -> Result<LockState> {
+    process_state(record.pid)
+}
+
+#[cfg(target_os = "linux")]
+fn current_pid_namespace() -> Option<u64> {
+    fs::metadata("/proc/self/ns/pid")
+        .ok()
+        .map(|metadata| metadata.ino())
+}
+
+#[cfg(target_os = "linux")]
+fn proc_visibility_is_ambiguous() -> bool {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else {
+        return true;
+    };
+    let mut found_proc = false;
+    for line in mounts.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.get(1) != Some(&"/proc") || fields.get(2) != Some(&"proc") {
+            continue;
+        }
+        found_proc = true;
+        if fields.get(3).is_some_and(|options| {
+            options
+                .split(',')
+                .any(|option| option.starts_with("hidepid="))
+        }) {
+            return true;
+        }
+    }
+    !found_proc
+}
+
+#[cfg(target_os = "linux")]
 fn process_state(pid: u32) -> Result<LockState> {
     match fs::metadata(format!("/proc/{pid}")) {
         Ok(_) => Ok(LockState::Live),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LockState::Dead),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if proc_visibility_is_ambiguous() {
+                return Ok(LockState::Unverifiable);
+            }
+            let pid = libc::pid_t::try_from(pid)
+                .map_err(|_| anyhow!("pi cache writer lock pid does not fit this platform"))?;
+            let result = unsafe { libc::kill(pid, 0) };
+            if result == 0 {
+                return Ok(LockState::Live);
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(code) if code == libc::ESRCH => Ok(LockState::Dead),
+                Some(code) if code == libc::EPERM => Ok(LockState::Unverifiable),
+                _ => Err(error.into()),
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             Ok(LockState::Unverifiable)
         }

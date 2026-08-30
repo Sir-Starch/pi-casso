@@ -21,7 +21,7 @@ fn direct_cached_source_delegates_snapshot_validation() -> Result<()> {
     let pool = DigitReaderPool::new(&source, 1, 1, 5)?;
 
     // When: the raw publication changes without republishing its sidecar.
-    std::fs::write(file.path(), b"271820")?;
+    std::fs::write(file.path(), b"27182")?;
 
     // Then: the source hides its raw path and the delegated read rejects the mutation.
     assert!(source.reader_path().is_none());
