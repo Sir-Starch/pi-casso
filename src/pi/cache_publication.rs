@@ -449,6 +449,7 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
             bail!("pi cache contains non-ASCII digit data and cannot be repaired");
         }
         if matches!(&sidecar, SidecarRead::Parsed(value) if value.matches_exact(&raw)) {
+            write_sidecar(&paths, &Sidecar::from_raw(&raw))?;
             return cleanup_previous(&paths);
         }
         if restore_previous(&paths)? {
@@ -461,6 +462,8 @@ pub(crate) fn repair_publication(raw_path: &Path) -> Result<()> {
                 file.set_len(sidecar.published_digits)?;
                 sync_publication_data(&file)?;
                 paths.sync_parent()?;
+                let repaired = RawSnapshot::read(&paths.raw, None)?;
+                write_sidecar(&paths, &Sidecar::from_raw(&repaired))?;
             }
             SidecarRead::Missing | SidecarRead::Invalid | SidecarRead::Parsed(_) => {
                 write_sidecar(&paths, &Sidecar::from_raw(&raw))?;

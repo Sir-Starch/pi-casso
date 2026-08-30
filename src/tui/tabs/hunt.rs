@@ -797,11 +797,25 @@ fn apply_resolved_backend(
 fn materialize_source(source: StartDigitSource) -> Result<(DigitSourceSpec, u64)> {
     #[cfg(test)]
     test_source_open_boundary()?;
+    materialize_source_inner(source)
+}
+
+fn materialize_source_inner(source: StartDigitSource) -> Result<(DigitSourceSpec, u64)> {
     let (source, generated_digit_count) = match source {
         StartDigitSource::Cache(path) => {
             let cache = pi::PiCache::new(path.clone());
             cache.ensure_parent()?;
-            let generated_digit_count = cache.published_digit_count()?;
+            let generated_digit_count = match cache.published_digit_count() {
+                Ok(count) => count,
+                Err(publication_error) => {
+                    cache.repair_publication().with_context(|| {
+                        format!(
+                            "could not recover pi cache after publication error: {publication_error:#}"
+                        )
+                    })?;
+                    cache.published_digit_count()?
+                }
+            };
             (DigitSourceSpec::cache(path), generated_digit_count)
         }
         StartDigitSource::File {
@@ -1380,6 +1394,39 @@ mod tests {
         tab.form.set_choice(WizardField::ArtSource, 1);
         tab.sync_enabled();
         assert!(tab.start_spec().is_err());
+    }
+
+    #[test]
+    fn materialize_source_repairs_stale_cache_before_start() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::time::Duration;
+
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("cache source root");
+        let raw = root.path().join("pi-cache.txt");
+        let cache = pi::PiCache::new(raw.clone());
+        cache.append_digits(&[3; 32]).expect("published cache");
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&raw)
+            .expect("open cache tail");
+        file.write_all(b"14").expect("append unpublished tail");
+        file.sync_all().expect("sync unpublished tail");
+
+        let (source, generated_digit_count) =
+            materialize_source_inner(StartDigitSource::Cache(raw.clone())).expect("recover cache");
+
+        assert_eq!(source.source_type, "cache");
+        assert_eq!(generated_digit_count, 32);
+        assert_eq!(cache.published_digit_count().expect("fast cache read"), 32);
+        assert_eq!(
+            std::fs::read(raw).expect("read repaired cache"),
+            vec![b'3'; 32]
+        );
     }
 
     #[test]
