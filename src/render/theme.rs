@@ -95,6 +95,7 @@ pub struct Theme {
     pub canvas_bg: Color,
     /// Background of the pixels that fall inside the target's placement window.
     pub canvas_target_bg: Color,
+    pub canvas_noise: Color,
     pub glyphs: Glyphs,
 }
 
@@ -127,6 +128,7 @@ impl Theme {
                 danger: Color::Reset,
                 canvas_bg: Color::Reset,
                 canvas_target_bg: Color::Reset,
+                canvas_noise: Color::Reset,
                 glyphs,
             },
             ThemeName::Dark => Self {
@@ -143,6 +145,7 @@ impl Theme {
                 danger: Color::Rgb(237, 112, 117),
                 canvas_bg: Color::Rgb(18, 27, 28),
                 canvas_target_bg: Color::Rgb(28, 47, 46),
+                canvas_noise: Color::Rgb(75, 92, 91),
                 glyphs,
             },
             ThemeName::Light => Self {
@@ -159,6 +162,7 @@ impl Theme {
                 danger: Color::Rgb(190, 54, 58),
                 canvas_bg: Color::Rgb(237, 244, 241),
                 canvas_target_bg: Color::Rgb(220, 237, 230),
+                canvas_noise: Color::Rgb(151, 171, 165),
                 glyphs,
             },
         }
@@ -184,6 +188,10 @@ impl Theme {
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
+    }
+
+    pub fn canvas_noise_style(self) -> Style {
+        self.paint(self.canvas_noise)
     }
 
     pub fn accent_style(self) -> Style {
@@ -288,6 +296,7 @@ mod tests {
         assert!(!theme.color);
         assert_eq!(theme.accent_style().fg, None);
         assert_eq!(theme.dim_style().fg, None);
+        assert_eq!(theme.canvas_noise_style().fg, None);
     }
 
     #[test]
